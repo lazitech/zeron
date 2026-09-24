@@ -2,11 +2,13 @@ use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-changed=src/browser/linux/helper.c");
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         return;
     }
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("zeron-webkit");
-    let flags = Command::new("pkg-config")
+    let pkg_config = env::var_os("PKG_CONFIG").unwrap_or_else(|| "pkg-config".into());
+    let flags = Command::new(pkg_config)
         .args(["--cflags", "--libs", "webkit2gtk-4.1", "json-glib-1.0"])
         .output()
         .expect("pkg-config is required to build the Linux browser helper");

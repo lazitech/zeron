@@ -199,6 +199,16 @@ impl SessionsEngine {
         }
     }
 
+    /// Read the active profile's durable event history for statistics. The
+    /// returned records never leave the engine; the RPC layer aggregates them
+    /// and only sends derived counts to the UI.
+    pub(crate) fn usage_records(
+        &self,
+        chat_id: &str,
+    ) -> Result<(Vec<crate::run_journal::JournalRecord>, u64), EngineError> {
+        Ok(self.inner.journal.records_with_skipped(chat_id)?)
+    }
+
     /// Wire the doc host (called once at engine assembly; the two services are mutually
     /// referential by design — sessions stream into docs, docs execute commands here).
     pub fn set_doc_host(&self, host: DocHost) {

@@ -109,6 +109,8 @@ pub mod methods {
     pub const LOCAL_DEVICE: &str = "LocalDevice";
     /// This engine runtime's fixed device and workspace identity.
     pub const ENGINE_INFO: &str = "EngineInfo";
+    /// Local profile usage aggregate for the Statistics page; no params.
+    pub const USAGE_STATISTICS: &str = "UsageStatistics";
     /// Readiness barrier for the engine runtime. The call completes once stores
     /// and journals are assembled, or fails with the assembly error.
     pub const ENGINE_READY: &str = "EngineReady";

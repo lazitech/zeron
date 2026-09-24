@@ -73,6 +73,7 @@ icon_assets![
     (QUEUE_PAPERCLIP, "queue-paperclip"),
     (CLOCK_CIRCLE, "clock-circle"),
     (CALENDAR, "calendar"),
+    (USAGE_STATS, "usage-stats"),
     (LIST, "list"),
     (FOLDER_WITH_FILES, "folder-with-files"),
     (FOLDER, "folder"),

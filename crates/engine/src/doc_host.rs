@@ -1096,6 +1096,45 @@ impl DocHost {
         &self.inner.config.device_id
     }
 
+    /// Read user-entry timestamps for the local statistics aggregate without
+    /// opening a cold chat's sync room. `None` means the workspace row proves
+    /// that a message exists but the local snapshot is absent or empty.
+    pub(crate) fn prompt_timestamps(&self, chat_id: &str) -> Result<Option<Vec<i64>>, EngineError> {
+        let chat_row = match self.workspace() {
+            Some(workspace) => workspace.chat(chat_id)?,
+            None => None,
+        };
+        let expected_latest = chat_row
+            .as_ref()
+            .and_then(|chat| chat.last_message_at.as_ref())
+            .map(|at| at.timestamp_millis());
+
+        let open = lock(&self.inner.handles).get(chat_id).cloned();
+        let entries = if let Some(handle) = open {
+            handle.doc.read_entries()?
+        } else {
+            let Some(bytes) = self.inner.store.load_snapshot(chat_id)? else {
+                return Ok(expected_latest.is_none().then(Vec::new));
+            };
+            let raw = loro::LoroDoc::new();
+            raw.import(&bytes).map_err(|error| {
+                EngineError::Other(format!("statistics snapshot import failed: {error}"))
+            })?;
+            SessionDoc::from_doc(raw).read_entries()?
+        };
+        if entries.is_empty() && expected_latest.is_some() {
+            return Ok(None);
+        }
+
+        Ok(Some(
+            entries
+                .into_iter()
+                .filter(|entry| entry.role == MessageRole::User)
+                .map(|entry| entry.created_at)
+                .collect(),
+        ))
+    }
+
     /// Open (or return) the chat's doc handle: load the local snapshot (or init fresh),
     /// start the change-driven task, and join the edge room when configured.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {

@@ -54,6 +54,7 @@ use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
     format_time_ago, org_name_valid, parse_orgs, sort_memberships,
 };
+use crate::statistics::StatisticsPage;
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript, TranscriptEvent};
@@ -452,6 +453,7 @@ impl SettingsSection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     Chat,
+    Statistics,
     Settings(SettingsSection),
 }
 
@@ -555,6 +557,7 @@ impl SessionPanels {
 pub enum NavEntry {
     /// A chat route; the id of the selected chat ("" = the new-chat canvas).
     Chat(String),
+    Statistics,
     Settings(SettingsSection),
 }
 
@@ -1422,7 +1425,7 @@ impl Render for SidebarPane {
             let theme = Theme::of(cx).clone();
             match shell.route {
                 Route::Settings(section) => shell.render_settings_nav(section, &theme, cx),
-                Route::Chat => shell.render_chat_sidebar(&theme, cx),
+                Route::Chat | Route::Statistics => shell.render_chat_sidebar(&theme, cx),
             }
         });
         div().size_full().child(inner).into_any_element()
@@ -1520,6 +1523,7 @@ pub struct Shell {
     route: Route,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
+    statistics_page: Option<Entity<StatisticsPage>>,
     devices_page: Option<Entity<DevicesPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
@@ -1805,6 +1809,7 @@ impl Shell {
         // straight into a settings section — these pages have no deep link and
         // synthetic input can't reach them on headless compositors.
         let route = match std::env::var("ZERON_OPEN_ROUTE").ok().as_deref() {
+            Some("statistics") => Route::Statistics,
             Some("settings") | Some("settings/devices") => {
                 Route::Settings(SettingsSection::Devices)
             }
@@ -1842,6 +1847,7 @@ impl Shell {
         };
         let nav = NavHistory::new(match route {
             Route::Chat => NavEntry::Chat(String::new()),
+            Route::Statistics => NavEntry::Statistics,
             Route::Settings(section) => NavEntry::Settings(section),
         });
         // Parent notifications carry presentation changes (session status,
@@ -1899,6 +1905,7 @@ impl Shell {
             right_tab_scroll: gpui::ScrollHandle::new(),
             route,
             nav,
+            statistics_page: None,
             devices_page: None,
             archived_page: None,
             appearance_page: None,
@@ -3824,6 +3831,16 @@ impl Shell {
         cx.notify();
     }
 
+    fn open_statistics(&mut self, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        self.route = Route::Statistics;
+        self.statistics_page = None;
+        self.nav.push(NavEntry::Statistics);
+        self.close_user_menu(cx);
+        self.close_chat_menu(cx);
+        cx.notify();
+    }
+
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         self.focus_composer(cx);
@@ -3862,10 +3879,25 @@ impl Shell {
             NavEntry::Settings(section) => {
                 self.route = Route::Settings(section);
             }
+            NavEntry::Statistics => {
+                self.route = Route::Statistics;
+                self.statistics_page = None;
+            }
         }
         self.close_user_menu(cx);
         self.close_chat_menu(cx);
         cx.notify();
+    }
+
+    fn statistics_outlet(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.statistics_page.is_none() {
+            let state = self.state.clone();
+            self.statistics_page = Some(cx.new(|cx| StatisticsPage::new(state, cx)));
+        }
+        match &self.statistics_page {
+            Some(page) => page.clone().into_any_element(),
+            None => Empty.into_any_element(),
+        }
     }
 
     /// Lazily create the entity for a settings section and return it renderable.
@@ -5146,7 +5178,7 @@ impl Shell {
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         match self.route {
             Route::Chat => self.render_session_title_bar(cx),
-            Route::Settings(_) => {
+            Route::Settings(_) | Route::Statistics => {
                 let inner = div()
                     .size_full()
                     .flex()
@@ -6792,6 +6824,49 @@ impl Shell {
         };
         let user_menu =
             self.render_user_menu(user_line.clone(), trigger_subline, menu_identity, theme, cx);
+        let statistics_selected = matches!(self.route, Route::Statistics);
+        let statistics_button = div()
+            .id("statistics-nav")
+            .mx(px(Theme::SPACE_SM))
+            .mb(px(2.0))
+            .px(px(Theme::SPACE_SM))
+            .py(px(Theme::SPACE_SM))
+            .rounded(px(8.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .cursor_pointer()
+            .bg(if statistics_selected {
+                theme.glass_hover()
+            } else {
+                motion::hover_blend(
+                    "statistics-nav",
+                    theme.glass_hover().opacity(0.0),
+                    theme.glass_hover().opacity(0.8),
+                )
+            })
+            .on_hover(motion::hover_listener("statistics-nav"))
+            .on_click(cx.listener(|this, _, _, cx| this.open_statistics(cx)))
+            .child(
+                icon(icons::USAGE_STATS)
+                    .size(px(16.0))
+                    .text_color(if statistics_selected {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(crate::typography::ui_rems(12.0))
+                    .text_color(if statistics_selected {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    })
+                    .child(SharedString::from("统计")),
+            );
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -6997,6 +7072,13 @@ impl Shell {
                         .child(notice),
                 )
             })
+            .child(
+                div()
+                    .px(px(Theme::SPACE_SM))
+                    .pb(px(2.0))
+                    .flex_none()
+                    .child(statistics_button),
+            )
             .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
             .into_any_element()
     }
@@ -8248,6 +8330,19 @@ impl Shell {
         let theme_owned = Theme::of(cx).clone();
         let theme = &theme_owned;
         let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
+
+        if matches!(self.route, Route::Statistics) {
+            let outlet = self.statistics_outlet(cx);
+            return div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .pt(px(Theme::TITLEBAR_HEIGHT))
+                .flex()
+                .flex_col()
+                .child(div().flex_1().min_h_0().child(outlet))
+                .into_any_element();
+        }
 
         // Settings route: just the section outlet — the section label lives in
         // the unified window titlebar now (render_title_bar). Settings never

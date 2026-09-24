@@ -20,6 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -32,7 +33,8 @@ use zeron_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use zeron_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
 use zeron_proto::{
     AuthState, ChangeRequestSummary, Chat, ChatIndicator, CheckoutChangeRequestStatus, Device,
-    EngineInfo, HarnessId, Session, SidebarPreferencesState, Space, WorkspaceScope,
+    EngineInfo, HarnessId, Session, SidebarPreferencesState, Space, UsageStatistics,
+    WorkspaceScope,
 };
 use zeron_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
@@ -44,6 +46,7 @@ use crate::change_requests::{
 // ownership on navigation; never clone whale payloads or retain live watches.
 const TRANSCRIPT_CACHE_CAP: usize = 12;
 const TRANSCRIPT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const USAGE_STATISTICS_CACHE_TTL: Duration = Duration::from_secs(60);
 
 struct CachedTranscript {
     prepared: Option<Arc<crate::transcript::PreparedTranscript>>,
@@ -745,6 +748,12 @@ pub struct AppState {
     pub local_device_id: Option<String>,
     /// Latest `UpdateStatus` frame — drives the sidebar update strip.
     pub update: Option<zeron_update::UpdateStatus>,
+    /// Latest process-local statistics snapshot, preloaded after engine attach.
+    pub(crate) usage_statistics: Option<Arc<UsageStatistics>>,
+    usage_statistics_updated_at: Option<Instant>,
+    pub(crate) usage_statistics_loading: bool,
+    pub(crate) usage_statistics_error: Option<String>,
+    usage_statistics_task: Option<Task<()>>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
@@ -822,6 +831,11 @@ impl AppState {
             review_comment_flushes: HashMap::new(),
             local_device_id: None,
             update: None,
+            usage_statistics: None,
+            usage_statistics_updated_at: None,
+            usage_statistics_loading: false,
+            usage_statistics_error: None,
+            usage_statistics_task: None,
             data_dir: None,
             engine: None,
             watch_tasks: Vec::new(),
@@ -1766,6 +1780,55 @@ impl AppState {
         self.engine.as_ref()
     }
 
+    /// Prepare a full statistics snapshot in the background. A fresh snapshot
+    /// is kept visible while stale data is refreshed; concurrent callers share
+    /// the in-flight request.
+    pub(crate) fn request_usage_statistics(&mut self, cx: &mut Context<Self>) {
+        if self.usage_statistics_loading
+            || self
+                .usage_statistics_updated_at
+                .is_some_and(|updated_at| updated_at.elapsed() < USAGE_STATISTICS_CACHE_TTL)
+        {
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            self.usage_statistics_error = Some("统计引擎尚未连接".into());
+            cx.notify();
+            return;
+        };
+        self.usage_statistics_loading = true;
+        self.usage_statistics_error = None;
+        cx.notify();
+
+        self.usage_statistics_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::USAGE_STATISTICS, serde_json::json!({}))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|value| {
+                    serde_json::from_value::<UsageStatistics>(value)
+                        .map_err(|error| error.to_string())
+                });
+            if let Err(error) = &result {
+                tracing::warn!(%error, "statistics preload failed");
+            }
+            this.update(cx, |state, cx| {
+                state.usage_statistics_loading = false;
+                match result {
+                    Ok(snapshot) => {
+                        state.usage_statistics = Some(Arc::new(snapshot));
+                        state.usage_statistics_updated_at = Some(Instant::now());
+                        state.usage_statistics_error = None;
+                    }
+                    Err(error) => state.usage_statistics_error = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     #[cfg(test)]
     pub(crate) fn set_test_engine(&mut self, handle: EngineHandle) {
         self.engine = Some(handle);
@@ -1811,6 +1874,11 @@ impl AppState {
         self.transfers.clear();
         self.local_device_id = None;
         self.update = None;
+        self.usage_statistics = None;
+        self.usage_statistics_updated_at = None;
+        self.usage_statistics_loading = false;
+        self.usage_statistics_error = None;
+        self.usage_statistics_task = None;
         cx.notify();
     }
 
@@ -1861,7 +1929,7 @@ impl AppState {
         self.workspace_scope = Some(engine_info.workspace_scope);
         self.local_device_id = Some(engine_info.device_id.clone());
         self.engine = Some(handle.clone());
-        let mut watch_tasks = Vec::with_capacity(10);
+        let mut watch_tasks = Vec::with_capacity(11);
         if let Some(task) = spawn_deferred_engine_watch(cx, handle.clone()) {
             watch_tasks.push(task);
         }
@@ -1924,6 +1992,7 @@ impl AppState {
             spawn_local_device_probe(cx, handle.clone()),
         ]);
         self.watch_tasks = watch_tasks;
+        self.request_usage_statistics(cx);
         self.reconcile_change_request_watches(cx);
         // EngineInfo is part of the attachment boundary: views must know which
         // data profile they reached before they are allowed to render Ready.

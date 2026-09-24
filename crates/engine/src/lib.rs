@@ -25,6 +25,7 @@ pub mod doc_host;
 mod http_error;
 pub mod instance_lock;
 pub mod local_import;
+mod native_usage_index;
 pub mod profile;
 pub mod registry;
 pub mod repos;
@@ -36,7 +37,9 @@ pub mod spaces;
 pub mod terminals;
 pub mod titles;
 mod transcript_history;
+mod native_token_usage;
 pub mod uploads;
+mod usage_stats;
 pub mod workspace_files;
 pub mod workspace_host;
 
@@ -136,6 +139,10 @@ pub struct EngineCore {
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub device_id: String,
+    /// Read-only summaries of local native agent histories, persisted under the
+    /// device data root. An unavailable index must not prevent the engine from
+    /// starting; statistics then report partial coverage and keep Zeron chats.
+    native_usage_index: Option<Arc<native_usage_index::NativeUsageIndex>>,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
     workspace_scope: WorkspaceScope,
@@ -211,6 +218,15 @@ impl EngineCore {
         std::fs::create_dir_all(data_dir)?;
         let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
         let device_id = load_or_create_device_id(data_dir)?;
+        let native_usage_index = match native_usage_index::NativeUsageIndex::open(
+            data_dir.join("statistics").join("native-index.sqlite3"),
+        ) {
+            Ok(index) => Some(Arc::new(index)),
+            Err(error) => {
+                tracing::warn!(%error, "native usage index unavailable; statistics will be partial");
+                None
+            }
+        };
         // This device's harness enablement (Settings → Agents) rides the
         // engine data dir — per-device, like the CLI installs it gates.
         registry.load_prefs(data_dir);
@@ -319,6 +335,7 @@ impl EngineCore {
             uploads,
             agent_accounts,
             device_id,
+            native_usage_index,
             local_import,
             workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
@@ -452,6 +469,9 @@ impl EngineCore {
         )
         .with_auth(self.auth())
         .with_previews(self.previews.clone());
+        if let Some(index) = self.native_usage_index.clone() {
+            rpc = rpc.with_native_usage_index(index);
+        }
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }

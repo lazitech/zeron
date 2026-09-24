@@ -1,7 +1,8 @@
 //! Per-session on-disk event journal (port of zeron's `run-journal.ts`, JSONL-shaped).
 //!
 //! One append-only JSONL file per chat under `{data_dir}/journals/{chat_id}.jsonl`; each
-//! line is `{"seq": n, "event": AgentEvent}` with a monotonically increasing `seq`. The
+//! line contains `seq`, `event`, and an optional `timestampMs` (absent on legacy rows),
+//! with a monotonically increasing `seq`. The
 //! journal is the durable replay source for live streams (`Subscribe` = replay then tail
 //! the broadcast hub) and the crash-recovery gauge: a journal whose LAST event is not
 //! `Done` belongs to a run that died mid-stream — boot recovery stamps its doc entry
@@ -16,6 +17,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use zeron_proto::AgentEvent;
@@ -29,9 +31,20 @@ pub enum JournalError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct JournalLine {
     seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timestamp_ms: Option<i64>,
     event: AgentEvent,
+}
+
+/// One readable journal row. Legacy rows deserialize with no timestamp.
+#[derive(Debug, Clone)]
+pub(crate) struct JournalRecord {
+    pub seq: u64,
+    pub timestamp_ms: Option<i64>,
+    pub event: AgentEvent,
 }
 
 struct ChatJournal {
@@ -129,6 +142,7 @@ impl RunJournal {
         let seq = journal.next_seq;
         let line = serde_json::to_string(&JournalLine {
             seq,
+            timestamp_ms: Some(Utc::now().timestamp_millis()),
             event: event.clone(),
         })?;
         let mut buf = Vec::with_capacity(line.len() + 2);
@@ -151,14 +165,35 @@ impl RunJournal {
         chat_id: &str,
         after_seq: u64,
     ) -> Result<Vec<(u64, AgentEvent)>, JournalError> {
+        let records = self.records(chat_id)?;
+        let last_seq = records.last().map(|record| record.seq).unwrap_or(0);
+        let from = if after_seq > last_seq { 0 } else { after_seq };
+        Ok(records
+            .into_iter()
+            .filter(|record| record.seq > from)
+            .map(|record| (record.seq, record.event))
+            .collect())
+    }
+
+    /// Every valid row for one chat, in journal order.
+    pub(crate) fn records(&self, chat_id: &str) -> Result<Vec<JournalRecord>, JournalError> {
         let path = self.path_for(chat_id);
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let all = read_lines(&path)?;
-        let last_seq = all.last().map(|(seq, _)| *seq).unwrap_or(0);
-        let from = if after_seq > last_seq { 0 } else { after_seq };
-        Ok(all.into_iter().filter(|(seq, _)| *seq > from).collect())
+        read_lines(&path)
+    }
+
+    /// Every valid row and the number of malformed rows, for usage coverage.
+    pub(crate) fn records_with_skipped(
+        &self,
+        chat_id: &str,
+    ) -> Result<(Vec<JournalRecord>, u64), JournalError> {
+        let path = self.path_for(chat_id);
+        if !path.exists() {
+            return Ok((Vec::new(), 0));
+        }
+        read_lines_with_skipped(&path)
     }
 
     /// The last event in a chat's journal, if any (ignores a torn tail line).
@@ -167,7 +202,10 @@ impl RunJournal {
         if !path.exists() {
             return Ok(None);
         }
-        Ok(read_lines(&path)?.into_iter().next_back())
+        Ok(read_lines(&path)?
+            .into_iter()
+            .next_back()
+            .map(|record| (record.seq, record.event)))
     }
 
     /// Crash-recovery scan: chat ids whose journal's last event is NOT a `Done` — their
@@ -184,8 +222,8 @@ impl RunJournal {
                 continue;
             };
             let last = read_lines(&path)?.into_iter().next_back();
-            match last {
-                Some((_, AgentEvent::Done { .. })) | None => {}
+            match last.map(|record| record.event) {
+                Some(AgentEvent::Done { .. }) | None => {}
                 Some(_) => stale.push(chat_id.to_string()),
             }
         }
@@ -205,26 +243,36 @@ impl RunJournal {
 }
 
 /// Parse every valid line; malformed lines (torn tail writes) are skipped.
-fn read_lines(path: &Path) -> Result<Vec<(u64, AgentEvent)>, JournalError> {
+fn read_lines(path: &Path) -> Result<Vec<JournalRecord>, JournalError> {
+    Ok(read_lines_with_skipped(path)?.0)
+}
+
+fn read_lines_with_skipped(path: &Path) -> Result<(Vec<JournalRecord>, u64), JournalError> {
     let file = match File::open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(e) => return Err(e.into()),
     };
     let mut out = Vec::new();
+    let mut skipped_lines = 0u64;
     for line in BufReader::new(file).lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
         match serde_json::from_str::<JournalLine>(&line) {
-            Ok(parsed) => out.push((parsed.seq, parsed.event)),
+            Ok(parsed) => out.push(JournalRecord {
+                seq: parsed.seq,
+                timestamp_ms: parsed.timestamp_ms,
+                event: parsed.event,
+            }),
             Err(err) => {
+                skipped_lines = skipped_lines.saturating_add(1);
                 tracing::warn!(path = %path.display(), error = %err, "journal: skipping malformed line");
             }
         }
     }
-    Ok(out)
+    Ok((out, skipped_lines))
 }
 
 /// Next seq (last valid seq + 1, starting at 1) and whether the file ends mid-line.
@@ -237,7 +285,7 @@ fn scan_tail(path: &Path) -> Result<(u64, bool), JournalError> {
     let needs_newline = bytes.last().is_some_and(|b| *b != b'\n');
     let next_seq = read_lines(path)?
         .last()
-        .map(|(seq, _)| seq + 1)
+        .map(|record| record.seq + 1)
         .unwrap_or(1);
     Ok((next_seq, needs_newline))
 }

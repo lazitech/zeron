@@ -1,0 +1,12 @@
+name: zeron-dev
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  # Cargo build helpers; Linux native-library metadata comes from Ubuntu.
+  - cmake
+  - ninja
+  - pkg-config
+  - curl
+  - git
+  - perl

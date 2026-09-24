@@ -34,6 +34,10 @@ zeron-ui = { path = "crates/ui" }
 zeron-syntax = { path = "crates/syntax" }
 zeron-theme = { path = "crates/theme" }
 
+# Read-only native coding-agent history parsers used by the statistics index.
+# Keep this pinned: the adapter contract is part of the on-disk index format.
+wake-core = { git = "https://github.com/iAmCorey/Wake.git", rev = "269c50b466b023a0f38cc14e34105ab27b983dd2" }
+
 # CRDT
 loro = "1.13"
 # Wire protocol for the SessionRoom DO rooms — official Rust twin of the npm
@@ -100,6 +104,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # storage
 rusqlite = { version = "0.32", features = ["bundled"] }
+zstd = "0.13"
 
 # misc
 # Global allocator on macOS only: libmalloc retains the churn high-water mark
