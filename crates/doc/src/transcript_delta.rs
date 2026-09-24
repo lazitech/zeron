@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use crate::parts::MessagePart;
 use crate::schema::SessionMessageEntry;
 
-/// Transcript changes and the current host-owned context snapshot travel together.
-/// Older readers ignore `contextUsage`; older hosts decode as unknown usage.
+/// Transcript changes and the current host-owned usage snapshots travel together.
+/// Older readers ignore the usage fields; older hosts decode as unknown usage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriptUpdate {
@@ -24,6 +24,8 @@ pub struct TranscriptUpdate {
     pub frame: TranscriptFrame,
     #[serde(default)]
     pub context_usage: Option<zeron_proto::ContextUsage>,
+    #[serde(default)]
+    pub session_usage: Option<zeron_proto::SessionUsage>,
     /// Historical content included in this update, independent of reset/delta
     /// encoding. Omitted on ordinary live updates and by older engines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -508,10 +510,16 @@ mod context_update_tests {
         let old = serde_json::json!({"reset": []});
         let update: TranscriptUpdate = serde_json::from_value(old).unwrap();
         assert_eq!(update.context_usage, None);
+        assert_eq!(update.session_usage, None);
         assert!(update.replay_baseline.is_none());
         let value = serde_json::to_value(TranscriptUpdate {
             frame: TranscriptFrame::reset(&[]),
             replay_baseline: Some(TranscriptBaseline::default()),
+            session_usage: Some(zeron_proto::SessionUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                cached_input_tokens: Some(80),
+            }),
             context_usage: Some(zeron_proto::ContextUsage {
                 tokens: Some(0),
                 window: Some(200000),
@@ -519,6 +527,7 @@ mod context_update_tests {
         })
         .unwrap();
         assert_eq!(value["contextUsage"]["tokens"], 0);
+        assert_eq!(value["sessionUsage"]["cachedInputTokens"], 80);
         let roundtrip: TranscriptUpdate = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(
             roundtrip.replay_baseline,

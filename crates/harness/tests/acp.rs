@@ -96,6 +96,96 @@ fn dones(events: &[AgentEvent]) -> Vec<(DoneStatus, Option<String>)> {
 }
 
 #[tokio::test]
+async fn pi_session_usage_restores_history_and_flushes_final_call_before_done() {
+    use serde_json::json;
+    use zeron_proto::SessionUsage;
+
+    for resume in [None, Some("s-loaded")] {
+        let dir = tempfile::tempdir().unwrap();
+        let sid = resume.unwrap_or("s-1");
+        let session_file = dir.path().join("session.jsonl");
+        let session_map = dir.path().join("session-map.json");
+        let records = [
+            json!({"type":"session", "version":3, "id":sid, "cwd":dir.path()}),
+            json!({"type":"message", "id":"old-call", "message":{
+                "role":"assistant", "usage":{
+                    "input":10, "output":20, "cacheRead":80, "cacheWrite":10
+                }
+            }}),
+        ];
+        std::fs::write(
+            &session_file,
+            records
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &session_map,
+            json!({"version":1, "sessions":{
+                (sid): {"sessionId":sid, "cwd":dir.path(), "sessionFile":session_file},
+                "unrelated": {"sessionId":"unrelated", "sessionFile":dir.path().join("absent.jsonl")}
+            }}).to_string(),
+        ).unwrap();
+        let harness = AcpHarness::pi()
+            .with_executable(fixture_path())
+            .with_pi_session_map(session_map)
+            .with_pi_context_directory(dir.path().join("context"));
+        let mut req = request("scenario:pi-usage");
+        req.cwd = dir.path().to_string_lossy().into_owned();
+        req.model = Some("default".into());
+        req.resume = resume.map(str::to_owned);
+        let (controls, _steer, _token) = controls();
+        let events = run_to_end(&harness, req, controls).await;
+        let snapshots: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::SessionUsage { usage } => Some(*usage),
+                _ => None,
+            })
+            .collect();
+        let final_usage = SessionUsage {
+            input_tokens: Some(160),
+            output_tokens: Some(25),
+            cached_input_tokens: Some(120),
+        };
+        assert_eq!(
+            snapshots,
+            vec![
+                SessionUsage {
+                    input_tokens: Some(100),
+                    output_tokens: Some(20),
+                    cached_input_tokens: Some(80),
+                },
+                final_usage
+            ]
+        );
+        assert_eq!(final_usage.cache_hit_rate(), Some(0.75));
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ContextUsageSnapshot {
+                    usage: zeron_proto::ContextUsage {
+                        tokens: Some(65),
+                        window: Some(200000)
+                    }
+                }
+            )),
+            "Pi's ring needs current context usage, independently of cumulative billing"
+        );
+        let done = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::Done { .. }))
+            .unwrap();
+        assert!(events[..done].contains(&AgentEvent::SessionUsage { usage: final_usage }));
+        assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+    }
+}
+
+#[tokio::test]
 async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
     let (controls, _steer, _token) = controls();
     let events = run_to_end(&harness(), request("scenario:happy"), controls).await;

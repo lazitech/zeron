@@ -14,8 +14,8 @@ use zeron_harness::{
     CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, TodoItem,
-    ToolCall, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, SessionUsage,
+    TodoItem, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 fn fixture_path() -> PathBuf {
@@ -298,6 +298,49 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
             error: None,
             session_id: Some("th-1".into()),
         })
+    );
+}
+
+#[tokio::test]
+async fn session_usage_forwards_absolute_parent_totals_and_ignores_child_updates() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:session-usage"), controls).await;
+
+    let snapshots: Vec<SessionUsage> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::SessionUsage { usage } => Some(*usage),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        snapshots,
+        vec![
+            SessionUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                cached_input_tokens: Some(80),
+            },
+            SessionUsage {
+                input_tokens: Some(150),
+                output_tokens: Some(30),
+                cached_input_tokens: Some(120),
+            },
+        ],
+        "parent snapshots stay absolute; child usage is consumed by routing"
+    );
+
+    let done_pos = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Done { .. }))
+        .expect("done emitted");
+    let first_usage_pos = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::SessionUsage { .. }))
+        .expect("first cumulative usage emitted");
+    assert!(
+        first_usage_pos < done_pos,
+        "usage is live before Done: {events:?}"
     );
 }
 

@@ -53,6 +53,7 @@ struct CachedTranscript {
     chat_id: String,
     entries: Vec<SessionMessageEntry>,
     context_usage: Option<zeron_proto::ContextUsage>,
+    session_usage: Option<zeron_proto::SessionUsage>,
     bytes: usize,
 }
 
@@ -714,6 +715,7 @@ pub struct AppState {
     /// chat's doc holds them (every device sees the same queue).
     pub queue: Vec<zeron_doc::QueuedMessage>,
     pub context_usage: Option<zeron_proto::ContextUsage>,
+    pub session_usage: Option<zeron_proto::SessionUsage>,
     /// The selected chat has a transcript from a `WatchDocMessages` reset
     /// (including a retained reset from an earlier visit). An
     /// empty transcript is otherwise indistinguishable from the pre-replay
@@ -818,6 +820,7 @@ impl AppState {
             transcript: Vec::new(),
             queue: Vec::new(),
             context_usage: None,
+            session_usage: None,
             transcript_replayed: false,
             transcript_baselines: HashMap::new(),
             transcript_cache: Default::default(),
@@ -977,6 +980,7 @@ impl AppState {
             self.selected_chat = None;
             self.transcript.clear();
             self.context_usage = None;
+            self.session_usage = None;
             self.transcript_revision = self.transcript_revision.wrapping_add(1);
             self.transcript_replayed = false;
             self.transcript_task = None;
@@ -1296,6 +1300,10 @@ impl AppState {
         }
         if self.context_usage != update.context_usage {
             self.context_usage = update.context_usage;
+            cx.notify();
+        }
+        if self.session_usage != update.session_usage {
+            self.session_usage = update.session_usage;
             cx.notify();
         }
         Ok(())
@@ -1866,6 +1874,7 @@ impl AppState {
         self.transcript_cache.clear();
         self.prepared_transcripts.clear();
         self.context_usage = None;
+        self.session_usage = None;
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.transcript_replayed = false;
         self.echoes.clear();
@@ -2145,6 +2154,7 @@ impl AppState {
                     chat_id: previous.clone(),
                     entries,
                     context_usage: self.context_usage,
+                    session_usage: self.session_usage,
                     bytes,
                 });
                 while self.transcript_cache.len() > TRANSCRIPT_CACHE_CAP
@@ -2168,6 +2178,7 @@ impl AppState {
         self.auto_selected = true;
         self.transcript.clear();
         self.context_usage = None;
+        self.session_usage = None;
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.transcript_replayed = false;
         if let Some(cached) = cached {
@@ -2186,6 +2197,7 @@ impl AppState {
             }
             self.transcript = cached.entries;
             self.context_usage = cached.context_usage;
+            self.session_usage = cached.session_usage;
             self.transcript_replayed = true;
         }
         self.transcript_task = None;
@@ -3416,6 +3428,7 @@ mod tests {
             let update = |id: &str| zeron_doc::TranscriptUpdate {
                 frame: TranscriptFrame::reset(&[user_entry(id)]),
                 context_usage: None,
+                session_usage: None,
                 replay_baseline: None,
             };
             state.select_chat(Some("whale".into()), cx);
@@ -3471,6 +3484,22 @@ mod tests {
                 })
                 .collect();
             state.apply_transcript(entries);
+            let session_usage = Some(zeron_proto::SessionUsage {
+                input_tokens: Some(1_000),
+                output_tokens: Some(50),
+                cached_input_tokens: Some(800),
+            });
+            state.session_usage = session_usage;
+            state.select_chat(Some("other".into()), cx);
+            assert_eq!(
+                state.session_usage, None,
+                "switching chats must clear session usage"
+            );
+            state.select_chat(Some("whale".into()), cx);
+            assert_eq!(
+                state.session_usage, session_usage,
+                "revisiting a cached chat must restore its session usage"
+            );
             let allocation = state.transcript.as_ptr();
             for _ in 0..10 {
                 state.select_chat(Some("other".into()), cx);

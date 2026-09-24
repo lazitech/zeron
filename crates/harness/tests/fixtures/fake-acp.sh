@@ -98,6 +98,16 @@ pid=$(rid "$promptline")
 
 case "$promptline" in
 
+*scenario:pi-usage*)
+  # Pi persists billing metadata before settling ACP. The usage observer's
+  # final refresh must catch this append even if its polling tick has not run.
+  printf '%s\n' '{"type":"message","id":"new-call","message":{"role":"assistant","usage":{"input":20,"output":5,"cacheRead":40,"cacheWrite":0}}}' >> session.jsonl
+  # The native Pi extension publishes its own context estimate; ACP does not.
+  printf '{"sessionId":"%s","tokens":65,"window":200000}\n' "$SID" > "$ZERON_PI_CONTEXT_DIR/$SID.json"
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"usage recorded"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
 *scenario:model-api*)
   if has "$MODEL_SETS" '"modelId":"grok-4.5"'; then
     update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"model switched"}}'

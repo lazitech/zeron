@@ -49,8 +49,8 @@ use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
-    SteeringMode, TodoItem, ToolCall, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SessionUsage,
+    SlashCommand, SteeringMode, TodoItem, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::process::{Child, Command, Stdio};
@@ -70,6 +70,9 @@ const HEALTH_POLL: Duration = Duration::from_millis(150);
 /// command endpoint deliberately bypasses this (its response can take the
 /// whole turn and is ignored anyway).
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// History is optional accounting state; never let a broken resume endpoint
+/// hold chat startup for the full ordinary HTTP bound.
+const SESSION_HISTORY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Bus reconnect: the server is our own child on loopback, so a dropped
 /// stream with a live process is transient — retry briefly, then treat the
@@ -699,6 +702,39 @@ impl Server {
         Ok(unwrap_data(info))
     }
 
+    /// V1's unpaginated durable message history. V2 restores cumulative
+    /// tokens from session_info instead of summing its paginated messages.
+    async fn session_messages(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> Result<Vec<Value>, HarnessError> {
+        let path = format!("/session/{session_id}/message");
+        let messages = unwrap_data(
+            tokio::time::timeout(SESSION_HISTORY_TIMEOUT, self.get_json(&path, directory))
+                .await
+                .map_err(|_| {
+                    HarnessError::Protocol(format!(
+                        "opencode GET {path} timed out after {}s",
+                        SESSION_HISTORY_TIMEOUT.as_secs()
+                    ))
+                })??,
+        );
+        match messages {
+            Value::Array(messages) => Ok(messages),
+            Value::Object(object) => object
+                .get("messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or_else(|| {
+                    HarnessError::Protocol(format!("opencode GET {path} returned no message list"))
+                }),
+            _ => Err(HarnessError::Protocol(format!(
+                "opencode GET {path} returned an invalid message list"
+            ))),
+        }
+    }
+
     /// Provider catalog for the picker, variant picking, and context
     /// windows. V1 advertises it on `/provider`; 2.x splits it into a flat
     /// enabled-model list on `/api/model` that folds into the same shape.
@@ -1179,6 +1215,233 @@ impl TurnState {
     }
 }
 
+/// Per-assistant-message token usage on the v1 wire. OpenCode sends several
+/// `message.updated` snapshots for the same assistant message, including an
+/// empty zero-valued placeholder while generation is still starting. Keeping
+/// the latest settled snapshot by id makes the session total idempotent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MessageUsage {
+    input: Option<u64>,
+    output: Option<u64>,
+    cache_read: Option<u64>,
+    cache_write: Option<u64>,
+    completed: bool,
+}
+
+impl MessageUsage {
+    fn from_info(info: &Value) -> Option<Self> {
+        let assistant = info.get("role").and_then(Value::as_str) == Some("assistant")
+            || info.get("type").and_then(Value::as_str) == Some("assistant");
+        if !assistant {
+            return None;
+        }
+        let tokens = info.get("tokens").unwrap_or(&Value::Null);
+        let usage = Self::from_tokens(
+            tokens,
+            info.get("time")
+                .and_then(|time| time.get("completed"))
+                .is_some_and(|completed| !completed.is_null()),
+        );
+        // A zero-valued in-progress message is just a placeholder. It must
+        // never erase a non-empty snapshot already stored for this id.
+        (!usage.is_empty_placeholder()).then_some(usage)
+    }
+
+    fn from_tokens(tokens: &Value, completed: bool) -> Self {
+        let cache = tokens.get("cache");
+        Self {
+            input: tokens.get("input").and_then(Value::as_u64),
+            output: tokens.get("output").and_then(Value::as_u64),
+            cache_read: cache
+                .and_then(|cache| cache.get("read"))
+                .and_then(Value::as_u64),
+            cache_write: cache
+                .and_then(|cache| cache.get("write"))
+                .and_then(Value::as_u64),
+            completed,
+        }
+    }
+
+    fn has_any_value(self) -> bool {
+        self.input.is_some()
+            || self.output.is_some()
+            || self.cache_read.is_some()
+            || self.cache_write.is_some()
+    }
+
+    fn is_empty_placeholder(self) -> bool {
+        !self.completed && !self.has_any_value()
+            || (!self.completed
+                && self.input.unwrap_or(0) == 0
+                && self.output.unwrap_or(0) == 0
+                && self.cache_read.unwrap_or(0) == 0
+                && self.cache_write.unwrap_or(0) == 0)
+    }
+
+    fn inclusive_input(self) -> Option<u64> {
+        Some(
+            self.input?
+                .saturating_add(self.cache_read?)
+                .saturating_add(self.cache_write?),
+        )
+    }
+
+    fn merge(&mut self, incoming: Self) -> bool {
+        // A settled message is authoritative for its id. Late empty or
+        // partial in-progress echoes must not regress it.
+        if self.completed && !incoming.completed {
+            return false;
+        }
+        let changed = *self != incoming;
+        *self = incoming;
+        changed
+    }
+}
+
+/// Session-level accounting shared by both OpenCode protocol generations.
+/// v1 sums de-duplicated assistant message snapshots. v2 publishes an
+/// absolute cumulative `session.usage.updated` snapshot; that value is kept
+/// in a separate slot so it can never be added to per-message totals.
+/// OpenCode's own usage helper treats `tokens.input` as exclusive of
+/// `cache.read`/`cache.write`, keeps `tokens.output` separate from
+/// `tokens.reasoning`, and uses cache reads as the hit numerator. Mirror that
+/// source semantics here: input adds both cache fields, output excludes
+/// reasoning, and missing cache fields stay unknown.
+#[derive(Debug)]
+struct SessionUsageState {
+    protocol: Protocol,
+    authoritative: bool,
+    messages: HashMap<String, MessageUsage>,
+    cumulative: Option<SessionUsage>,
+}
+
+impl SessionUsageState {
+    fn new(protocol: Protocol, authoritative: bool) -> Self {
+        Self {
+            protocol,
+            authoritative,
+            messages: HashMap::new(),
+            cumulative: None,
+        }
+    }
+
+    async fn restore(
+        &mut self,
+        server: &Server,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> Result<(), HarnessError> {
+        if self.protocol == Protocol::V2 {
+            let info = tokio::time::timeout(
+                SESSION_HISTORY_TIMEOUT,
+                server.session_info(session_id, directory),
+            )
+            .await
+            .map_err(|_| HarnessError::Protocol("opencode session usage timed out".into()))??;
+            self.apply_cumulative(session_id, &info);
+            if self.cumulative.is_none() {
+                return Err(HarnessError::Protocol(
+                    "opencode session has no cumulative usage".into(),
+                ));
+            }
+        } else {
+            let rows = server.session_messages(session_id, directory).await?;
+            self.restore_messages(session_id, &rows);
+            self.authoritative = true;
+        }
+        Ok(())
+    }
+
+    fn restore_messages(&mut self, session_id: &str, rows: &[Value]) {
+        for row in rows {
+            let info = row.get("info").unwrap_or(row);
+            // The endpoint is session-scoped; reject explicitly foreign rows.
+            if info
+                .get("sessionID")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id != session_id)
+            {
+                continue;
+            }
+            let Some(id) = info.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(usage) = MessageUsage::from_info(info) else {
+                continue;
+            };
+            self.messages.entry(id.to_owned()).or_default().merge(usage);
+        }
+    }
+
+    fn apply_message(&mut self, session_id: &str, info: &Value) -> Option<SessionUsage> {
+        if self.protocol != Protocol::V1
+            || info
+                .get("sessionID")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id != session_id)
+        {
+            return None;
+        }
+        let id = info.get("id").and_then(Value::as_str)?;
+        let usage = MessageUsage::from_info(info)?;
+        let changed = self.messages.entry(id.to_owned()).or_default().merge(usage);
+        changed.then(|| self.snapshot()).flatten()
+    }
+
+    fn apply_cumulative(&mut self, session_id: &str, props: &Value) -> Option<SessionUsage> {
+        if self.protocol != Protocol::V2
+            || props
+                .get("sessionID")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id != session_id)
+        {
+            return None;
+        }
+        let tokens = props.get("tokens")?;
+        let parsed = MessageUsage::from_tokens(tokens, true);
+        if !parsed.has_any_value() {
+            return None;
+        }
+        let usage = SessionUsage {
+            input_tokens: parsed.inclusive_input(),
+            output_tokens: parsed.output,
+            // Cache-read tokens are the cache-hit numerator. Cache-write is
+            // part of total input, but is not a hit.
+            cached_input_tokens: parsed.cache_read,
+        };
+        self.authoritative = true;
+        if self.cumulative == Some(usage) {
+            return None;
+        }
+        self.cumulative = Some(usage);
+        Some(usage)
+    }
+
+    fn snapshot(&self) -> Option<SessionUsage> {
+        if !self.authoritative {
+            return None;
+        }
+        if self.protocol == Protocol::V2 {
+            return self.cumulative;
+        }
+        if self.messages.is_empty() {
+            return None;
+        }
+        // Every contributing message must report a field for its total to
+        // be known. A partial history must never look like a complete total.
+        let sum = |field: fn(&MessageUsage) -> Option<u64>| {
+            self.messages.values().try_fold(0u64, |total, usage| {
+                Some(total.saturating_add(field(usage)?))
+            })
+        };
+        Some(SessionUsage {
+            input_tokens: sum(|usage| usage.inclusive_input()),
+            output_tokens: sum(|usage| usage.output),
+            cached_input_tokens: sum(|usage| usage.cache_read),
+        })
+    }
+}
+
 async fn run_session(session: Session) {
     let Session {
         mut server,
@@ -1200,25 +1463,27 @@ async fn run_session(session: Session) {
 
     // ---- session create/resume -------------------------------------------
     let setup = async {
-        let session_id = match &request.resume {
+        let (session_id, resumed) = match &request.resume {
             Some(resume) => {
                 // Sessions are durable server-side: resume = reuse the id.
                 match server.session_info(resume, dir).await {
-                    Ok(info) => info
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or(resume)
-                        .to_owned(),
+                    Ok(info) => (
+                        info.get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or(resume)
+                            .to_owned(),
+                        true,
+                    ),
                     Err(e) => {
                         tracing::debug!(
                             target: "zeron_harness::opencode",
                             "session resume failed (starting fresh): {e}"
                         );
-                        create_session(&server, dir).await?
+                        (create_session(&server, dir).await?, false)
                     }
                 }
             }
-            None => create_session(&server, dir).await?,
+            None => (create_session(&server, dir).await?, false),
         };
 
         // Provider catalog: resolves the model's advertised reasoning
@@ -1239,9 +1504,9 @@ async fn run_session(session: Session) {
                 .set_model(&session_id, &provider, &model_id, variant.as_deref(), dir)
                 .await?;
         }
-        Ok::<(String, ProviderCatalog), HarnessError>((session_id, providers))
+        Ok::<(String, ProviderCatalog, bool), HarnessError>((session_id, providers, resumed))
     };
-    let (session_id, providers) = tokio::select! {
+    let (session_id, providers, resumed) = tokio::select! {
         res = setup => match res {
             Ok(v) => v,
             Err(e) => {
@@ -1294,6 +1559,25 @@ async fn run_session(session: Session) {
         .collect();
     drop(providers);
 
+    let protocol = server.protocol().await;
+    let mut session_usage = SessionUsageState::new(protocol, !resumed);
+    if resumed {
+        match session_usage.restore(&server, &session_id, dir).await {
+            Ok(()) => {}
+            Err(e) => {
+                // A resumed session whose history could not be loaded is not
+                // safe to present as a complete total. v1 has no cumulative
+                // fallback; v2 can still become authoritative if its
+                // session.usage.updated stream arrives later.
+                session_usage.authoritative = false;
+                tracing::debug!(
+                    target: "zeron_harness::opencode",
+                    "session usage history load failed (keeping totals unknown): {e}"
+                );
+            }
+        }
+    }
+
     let mut assistant_message_id = new_message_id();
     if !send(
         &event_tx,
@@ -1307,6 +1591,12 @@ async fn run_session(session: Session) {
         },
     )
     .await
+    {
+        server.shutdown(kill_grace).await;
+        return;
+    }
+    if let Some(usage) = session_usage.snapshot()
+        && !send(&event_tx, AgentEvent::SessionUsage { usage }).await
     {
         server.shutdown(kill_grace).await;
         return;
@@ -1412,6 +1702,7 @@ async fn run_session(session: Session) {
     let mut steering_open = true;
     let mut interrupt_requested = false;
     let mut pending_usage: Option<AgentEvent> = None;
+    let mut usage_history_retried = false;
     let mut done_sent = false;
 
     // Post-abort grace: the abort endpoint promised an idle; if it never
@@ -1429,6 +1720,16 @@ async fn run_session(session: Session) {
                 continue $label;
             }
             turn.active = false;
+            if !session_usage.authoritative && !usage_history_retried {
+                usage_history_retried = true;
+                if session_usage.restore(&server, &session_id, dir).await.is_ok() {
+                    if let Some(usage) = session_usage.snapshot()
+                        && !send(&event_tx, AgentEvent::SessionUsage { usage }).await
+                    {
+                        break $label;
+                    }
+                }
+            }
             if let Some(usage) = pending_usage.take()
                 && !send(&event_tx, usage).await
             {
@@ -1686,6 +1987,7 @@ async fn run_session(session: Session) {
                             unbound_children: &mut unbound_children,
                             turn: &mut turn,
                             pending_usage: &mut pending_usage,
+                            session_usage: &mut session_usage,
                             context_windows: &context_windows,
                         }).await;
                         match outcome {
@@ -2020,6 +2322,7 @@ struct BusCtx<'a> {
     unbound_children: &'a mut HashMap<String, String>,
     turn: &'a mut TurnState,
     pending_usage: &'a mut Option<AgentEvent>,
+    session_usage: &'a mut SessionUsageState,
     context_windows: &'a HashMap<String, u64>,
 }
 
@@ -2072,6 +2375,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
         unbound_children,
         turn,
         pending_usage,
+        session_usage,
         context_windows,
     } = ctx;
     // Envelope styles: /global/event wraps ({payload: {...}}); a bare
@@ -2223,6 +2527,28 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             }
             BusOutcome::Continue
         }
+        "session.usage.updated" if is_ours => {
+            // v2 publishes absolute session totals. Keep them on the
+            // cumulative path; treating this as a synthetic message would
+            // make every update look like another billable response and
+            // would also feed cumulative counts into context occupancy.
+            if let Some(tokens) = props.get("tokens") {
+                let input = tokens.get("input").and_then(Value::as_u64).unwrap_or(0);
+                let output = tokens.get("output").and_then(Value::as_u64).unwrap_or(0);
+                if input > 0 || output > 0 {
+                    *pending_usage = Some(AgentEvent::Usage {
+                        input_tokens: input,
+                        output_tokens: output,
+                    });
+                }
+            }
+            if let Some(usage) = session_usage.apply_cumulative(session_id, props)
+                && !send(event_tx, AgentEvent::SessionUsage { usage }).await
+            {
+                return BusOutcome::ConsumerGone;
+            }
+            BusOutcome::Continue
+        }
         "message.updated" => {
             let info = props.get("info").unwrap_or(&Value::Null);
             let (Some(session), Some(message), Some(role)) = (
@@ -2237,8 +2563,14 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                     .assistant_messages
                     .entry(message.to_owned())
                     .or_insert(role == "assistant");
-                // Token usage rides the assistant message; the last one
-                // before idle wins, emitted right before Done.
+                if role == "assistant"
+                    && let Some(usage) = session_usage.apply_message(session_id, info)
+                    && !send(event_tx, AgentEvent::SessionUsage { usage }).await
+                {
+                    return BusOutcome::ConsumerGone;
+                }
+                // Legacy turn usage: the last assistant message before idle
+                // wins. Context occupancy remains separate from session totals.
                 if role == "assistant"
                     && let Some(tokens) = info.get("tokens")
                 {
@@ -3243,19 +3575,14 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<V2ToolKey, String>)
             if tokens.is_null() {
                 return Vec::new();
             }
-            // Cumulative totals keyed to a synthetic message: registers
-            // Usage + ContextUsage exactly like the 1.x assistant
-            // message.updated did. (No providerID/modelID on this frame —
-            // the context window is dropped.)
+            // Preserve the event as a dedicated cumulative usage payload.
+            // It is not a message and must not be folded into context
+            // occupancy or added once per repeated SSE snapshot.
             vec![json!({
-                "type": "message.updated",
+                "type": "session.usage.updated",
                 "properties": {
-                    "info": {
-                        "sessionID": session(),
-                        "id": "usage",
-                        "role": "assistant",
-                        "tokens": tokens,
-                    }
+                    "sessionID": session(),
+                    "tokens": tokens,
                 }
             })]
         }

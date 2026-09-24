@@ -31,6 +31,8 @@
 mod antigravity_paths;
 mod devin_models;
 mod normalize;
+mod pi_context;
+mod pi_usage;
 mod subagent;
 mod subagent_devin;
 
@@ -841,6 +843,9 @@ pub struct AcpHarness {
     /// Override of the agent's on-disk sessions root (grok's
     /// `~/.grok/sessions`), where subagent transcripts are tailed from.
     sessions_root: Option<PathBuf>,
+    /// Override for pi-acp's session-id → native-session-file map (tests).
+    pi_session_map: Option<PathBuf>,
+    pi_context_directory: Option<PathBuf>,
     /// Grace between `session/cancel` and SIGTERM.
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
@@ -866,6 +871,8 @@ impl AcpHarness {
             spec,
             executable: None,
             sessions_root: None,
+            pi_session_map: None,
+            pi_context_directory: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             // Generous: the handshake is local work for every agent
@@ -1050,6 +1057,20 @@ impl AcpHarness {
         self
     }
 
+    /// Test seam: read Pi's cumulative usage from a separate adapter session map.
+    #[doc(hidden)]
+    pub fn with_pi_session_map(mut self, path: impl Into<PathBuf>) -> Self {
+        self.pi_session_map = Some(path.into());
+        self
+    }
+
+    /// Test seam: consume native context snapshots without installing an extension.
+    #[doc(hidden)]
+    pub fn with_pi_context_directory(mut self, path: impl Into<PathBuf>) -> Self {
+        self.pi_context_directory = Some(path.into());
+        self
+    }
+
     /// Tune the interrupt→SIGTERM→SIGKILL escalation timing.
     pub fn with_graces(mut self, interrupt_grace: Duration, kill_grace: Duration) -> Self {
         self.interrupt_grace = interrupt_grace;
@@ -1213,11 +1234,25 @@ impl AcpHarness {
         block_on_install: bool,
         extra_args: &[String],
     ) -> Result<(Child, crate::StderrTail), HarnessError> {
+        self.spawn_agent_with_context(cwd, block_on_install, extra_args, None)
+            .await
+    }
+
+    async fn spawn_agent_with_context(
+        &self,
+        cwd: Option<&str>,
+        block_on_install: bool,
+        extra_args: &[String],
+        context: Option<&pi_context::Bridge>,
+    ) -> Result<(Child, crate::StderrTail), HarnessError> {
         let (exe, args) = self.resolve_program(block_on_install).await?;
         let mut cmd = Command::new(&exe);
         cmd.args(args);
         cmd.args(extra_args);
         crate::compose_child_path(&mut cmd, &exe);
+        if let Some(context) = context {
+            cmd.env(pi_context::DIRECTORY_ENV, &context.directory);
+        }
         if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
             cmd.current_dir(cwd);
         }
@@ -1724,7 +1759,20 @@ impl Harness for AcpHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        let (mut child, stderr_tail) = self.spawn_agent(Some(&request.cwd), true, &[]).await?;
+        let pi_context = if self.spec.id == HarnessId::Pi {
+            match pi_context::Bridge::prepare(self.pi_context_directory.as_deref()) {
+                Ok(bridge) => Some(bridge),
+                Err(error) => {
+                    tracing::warn!(%error, "Pi context bridge unavailable");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let (mut child, stderr_tail) = self
+            .spawn_agent_with_context(Some(&request.cwd), true, &[], pi_context.as_ref())
+            .await?;
         let stdin = child
             .stdin
             .take()
@@ -1752,6 +1800,8 @@ impl Harness for AcpHarness {
             effort_in_model_id: self.spec.effort_in_model_id,
             auth_method: self.spec.auth_method,
             sessions_root: self.sessions_root.clone(),
+            pi_session_map: self.pi_session_map.clone(),
+            pi_context,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             handshake_timeout: self.handshake_timeout,
@@ -1785,6 +1835,8 @@ struct Session {
     auth_method: Option<&'static str>,
     /// Sessions-root override for the subagent transcript tail (tests).
     sessions_root: Option<PathBuf>,
+    pi_session_map: Option<PathBuf>,
+    pi_context: Option<pi_context::Bridge>,
     prompt_transform: fn(Option<ReasoningLevel>, &str) -> String,
     effort_values: fn(Option<ReasoningLevel>, Option<&str>) -> Vec<&'static str>,
     interrupt_grace: Duration,
@@ -2686,6 +2738,8 @@ async fn run_session(session: Session) {
         effort_in_model_id,
         auth_method,
         sessions_root,
+        pi_session_map,
+        pi_context,
         prompt_transform,
         effort_values,
         interrupt_grace,
@@ -2954,6 +3008,22 @@ async fn run_session(session: Session) {
         return;
     }
 
+    // pi-acp drops native context occupancy and billing breakdowns.
+    // Observe only the exact native session identified by its adapter map.
+    // The observer emits complete snapshots through the same usage event as
+    // native providers; its lifetime is bounded by this session task.
+    let pi_usage = (harness == HarnessId::Pi).then(|| {
+        pi_usage::Observer::start(
+            session_id.clone(),
+            pi_session_map,
+            pi_context.as_ref().map(|bridge| bridge.directory.clone()),
+            event_tx.clone(),
+        )
+    });
+    if let Some(observer) = &pi_usage {
+        observer.refresh().await;
+    }
+
     // Subagent correlation + transcript tails: Devin carries nested updates
     // on ACP itself; everything else gets the Grok tracker (inert without
     // Grok's subagent lifecycle extension).
@@ -3158,6 +3228,9 @@ async fn run_session(session: Session) {
                 }
                 // Per-turn token usage, when the adapter settles the prompt
                 // with it (claude-agent-acp and codex-acp both do).
+                if let Some(observer) = &pi_usage {
+                    observer.refresh().await;
+                }
                 if let Some(usage) = usage_from_response(&res)
                     && !send(&event_tx, usage).await
                 {
@@ -3328,6 +3401,9 @@ async fn run_session(session: Session) {
                             AgentEvent::AssistantMessageCompleted { assistant_message_id: prev },
                         )
                         .await;
+                        if let Some(observer) = &pi_usage {
+                            observer.refresh().await;
+                        }
                         if let Some(usage) = usage_from_response(&res) {
                             let _ = send(&event_tx, usage).await;
                         }
@@ -3813,6 +3889,11 @@ async fn run_session(session: Session) {
         handle.abort();
     }
     shutdown_child(&mut child, kill_grace).await;
+    // A final flush may happen while the native process winds down. Usage
+    // snapshots are valid after Done and cannot reopen the engine's turn.
+    if let Some(observer) = &pi_usage {
+        observer.refresh().await;
+    }
 }
 
 #[cfg(test)]

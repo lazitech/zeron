@@ -1503,6 +1503,7 @@ async fn drive_run(
     let run_cwd = request.cwd.clone();
     if request.resume.is_none() {
         let _ = doc.clear_context_usage();
+        let _ = doc.clear_session_usage();
     }
     // Kept whole for the startup-crash retry (same user entry; dispatch
     // re-injects the stored resume id). Option so the retry branch (inside
@@ -2032,6 +2033,23 @@ async fn drive_run(
         if let AgentEvent::ContextUsage { tokens, window } = &event {
             if let Err(err) = doc_ref.update_context_usage(*tokens, *window) {
                 tracing::warn!(%chat_id, error = %err, "context usage write failed");
+            }
+            continue;
+        }
+        // Native adapters can report an exact snapshot whose unknown token
+        // count is meaningful after compaction. Replace the occupancy value
+        // without reopening a parked/completed turn.
+        if let AgentEvent::ContextUsageSnapshot { usage } = &event {
+            if let Err(err) = doc_ref.replace_context_usage(*usage) {
+                tracing::warn!(%chat_id, error = %err, "exact context usage write failed");
+            }
+            continue;
+        }
+        // Cumulative counters may arrive after Done as well. Replacing the
+        // snapshot is idempotent and must not reopen a completed turn.
+        if let AgentEvent::SessionUsage { usage } = &event {
+            if let Err(err) = doc_ref.update_session_usage(*usage) {
+                tracing::warn!(%chat_id, error = %err, "session usage write failed");
             }
             continue;
         }

@@ -14,7 +14,8 @@
 //!   `sandboxPolicy`, and approval policy.
 //! - Notifications map to [`AgentEvent`]s: agentMessage/reasoning deltas (both
 //!   `delta`/`textDelta` spellings), item lifecycles → typed ToolCall/ToolResult,
-//!   `thread/tokenUsage/updated` → Usage, turn/completed|failed|aborted → Done.
+//!   `thread/tokenUsage/updated` → context/cumulative usage plus the legacy
+//!   per-turn Usage, turn/completed|failed|aborted → Done.
 //! - Approvals + sandbox: yolo mode. The wire policy is always `"never"` and
 //!   the sandbox is forced to `danger-full-access` — parity with the Claude
 //!   adapter's auto-approve-everything (unattended runs). Stray
@@ -63,7 +64,7 @@ use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
     ChildRoute, Phase, ReasoningStream, delta_text, item_id, item_type, notification_thread_id,
-    route_child_notification, turn_error_message, turn_id, usage_event,
+    route_child_notification, session_usage_event, turn_error_message, turn_id, usage_event,
 };
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
@@ -1130,6 +1131,8 @@ async fn run_session(session: Session) {
 
                     "thread/tokenUsage/updated" => {
                         if let Some(usage) = normalize::context_usage_event(&params)
+                            && !send(&event_tx, usage).await { break 'main; }
+                        if let Some(usage) = session_usage_event(&params)
                             && !send(&event_tx, usage).await { break 'main; }
                         if let Some(usage) = usage_event(&params) {
                             pending_usage = Some(usage);

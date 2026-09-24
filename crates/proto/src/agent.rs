@@ -388,11 +388,26 @@ pub enum AgentEvent {
         tokens: Option<u64>,
         window: Option<u64>,
     },
+    /// Exact context occupancy from a native session. Unlike
+    /// [`AgentEvent::ContextUsage`], `None` for `tokens` is meaningful: it
+    /// clears a stale occupancy value (for example immediately after
+    /// compaction) while the context window can remain known.
+    #[serde(rename_all = "camelCase")]
+    ContextUsageSnapshot {
+        usage: ContextUsage,
+    },
     /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
     #[serde(rename_all = "camelCase")]
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+    },
+    /// Latest absolute token totals reported by a native session. Unlike
+    /// [`AgentEvent::Usage`], this snapshot is cumulative for the session and may be
+    /// replaced by a newer snapshot without adding it again.
+    #[serde(rename_all = "camelCase")]
+    SessionUsage {
+        usage: SessionUsage,
     },
     /// The agent advertised (or changed) its slash-command set — ACP
     /// `available_commands_update`. The engine caches the latest list per
@@ -585,6 +600,81 @@ pub struct ContextUsage {
 impl ContextUsage {
     pub fn fraction(self) -> Option<f64> {
         Some(self.tokens? as f64 / self.window.filter(|n| *n > 0)? as f64)
+    }
+}
+
+/// Absolute token totals reported by a native agent session.
+///
+/// `input_tokens` includes cached input tokens when the provider reports them;
+/// `cached_input_tokens` is the cached subset used to derive the hit rate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SessionUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+}
+
+impl SessionUsage {
+    /// Fraction of input tokens served from cache, when the snapshot is valid.
+    pub fn cache_hit_rate(self) -> Option<f64> {
+        let input = self.input_tokens.filter(|tokens| *tokens > 0)?;
+        let cached = self.cached_input_tokens?;
+        (cached <= input).then_some(cached as f64 / input as f64)
+    }
+}
+
+#[cfg(test)]
+mod session_usage_tests {
+    use super::SessionUsage;
+
+    #[test]
+    fn cache_hit_rate_requires_a_valid_cached_subset() {
+        assert_eq!(
+            SessionUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                cached_input_tokens: Some(40),
+            }
+            .cache_hit_rate(),
+            Some(0.4)
+        );
+        assert_eq!(
+            SessionUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                cached_input_tokens: Some(0),
+            }
+            .cache_hit_rate(),
+            Some(0.0)
+        );
+        assert_eq!(
+            SessionUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                cached_input_tokens: None,
+            }
+            .cache_hit_rate(),
+            None
+        );
+        assert_eq!(
+            SessionUsage {
+                input_tokens: Some(0),
+                output_tokens: Some(20),
+                cached_input_tokens: Some(0),
+            }
+            .cache_hit_rate(),
+            None
+        );
+        assert_eq!(
+            SessionUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                cached_input_tokens: Some(101),
+            }
+            .cache_hit_rate(),
+            None
+        );
     }
 }
 

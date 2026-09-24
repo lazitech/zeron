@@ -162,6 +162,19 @@ case "$turnline" in
   emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
   ;;
 
+*scenario:session-usage*)
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  # Register one child so its token-usage notification follows the child
+  # routing table and cannot update the parent session snapshot.
+  emit '{"method":"item/started","params":{"threadId":"th-1","item":{"id":"usage-child","type":"subAgentActivity","kind":"started","agentThreadId":"child-usage","agentPath":"/root/usage"}}}'
+  emit '{"method":"thread/tokenUsage/updated","params":{"threadId":"th-1","tokenUsage":{"last":{"inputTokens":100,"outputTokens":20},"total":{"inputTokens":100,"outputTokens":20,"cachedInputTokens":80}}}}'
+  emit '{"method":"thread/tokenUsage/updated","params":{"threadId":"child-usage","tokenUsage":{"last":{"inputTokens":900,"outputTokens":90},"total":{"inputTokens":900,"outputTokens":90,"cachedInputTokens":890}}}}'
+  # A second absolute snapshot must be forwarded as-is, never summed with the
+  # first one by the harness.
+  emit '{"method":"thread/tokenUsage/updated","params":{"threadId":"th-1","tokenUsage":{"last":{"inputTokens":150,"outputTokens":30},"total":{"inputTokens":150,"outputTokens":30,"cachedInputTokens":120}}}}'
+  emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1"}}}'
+  ;;
+
 *scenario:child-identity*)
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
   cat "$(dirname "$0")/codex/child-identity.jsonl"

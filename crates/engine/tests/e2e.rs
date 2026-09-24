@@ -810,9 +810,9 @@ async fn retry_reissues_a_swallowed_send() {
     .await;
     wait_for(
         || {
-            entries_now(&core)
-                .iter()
-                .any(|e| e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete))
+            entries_now(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
         },
         "re-issued send runs to completion",
     )
@@ -2019,11 +2019,9 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
     );
     wait_for(
         || {
-            entries(&core)
-                .iter()
-                .any(|e| {
-                    e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
-                })
+            entries(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
         },
         "run completes",
     )
@@ -2306,7 +2304,92 @@ async fn parked_steer_restamps_started_at_and_idle_clears_it() {
 
 #[tokio::test]
 async fn context_usage_settles_after_done_without_reopening_the_turn() {
+    for exact_unknown in [false, true] {
+        let expected_tokens = if exact_unknown { None } else { Some(0) };
+        let dir = tempfile::tempdir().unwrap();
+        let core = assemble(
+            dir.path(),
+            Arc::new(ScriptedHarness {
+                script: vec![
+                    AgentEvent::TextDelta {
+                        text: "Finished".into(),
+                    },
+                    AgentEvent::ContextUsage {
+                        tokens: Some(64000),
+                        window: Some(200000),
+                    },
+                    done(DoneStatus::Completed),
+                    AgentEvent::Subagent {
+                        parent_tool_use_id: "child".into(),
+                        event: Box::new(AgentEvent::ContextUsage {
+                            tokens: Some(999999),
+                            window: Some(1000000),
+                        }),
+                    },
+                    if exact_unknown {
+                        AgentEvent::ContextUsageSnapshot {
+                            usage: zeron_proto::ContextUsage {
+                                tokens: None,
+                                window: Some(200000),
+                            },
+                        }
+                    } else {
+                        AgentEvent::ContextUsage {
+                            tokens: Some(0),
+                            window: None,
+                        }
+                    },
+                ],
+                step_delay: Duration::from_millis(20),
+                hang_until_interrupt: false,
+            }),
+        );
+        let handle = core.doc_host.open(CHAT).unwrap();
+        queue_as_viewer(
+            handle.doc(),
+            "context-run",
+            SessionCommandPayload::Run {
+                request: run_request("measure context"),
+                message_id: "context-user".into(),
+            },
+        );
+        wait_for(
+            || {
+                handle
+                    .doc()
+                    .context_usage()
+                    .is_some_and(|u| u.tokens == expected_tokens)
+            },
+            "post-turn context update",
+        )
+        .await;
+        assert_eq!(
+            handle.doc().context_usage(),
+            Some(zeron_proto::ContextUsage {
+                tokens: expected_tokens,
+                window: Some(200000)
+            })
+        );
+        assert_eq!(
+            core.sessions.session_status(CHAT).map(|s| s.status),
+            Some(SessionStatus::Idle)
+        );
+        assert_eq!(
+            entries(&core).len(),
+            2,
+            "usage does not create transcript rows"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_usage_settles_after_done_without_reopening_the_turn() {
     let dir = tempfile::tempdir().unwrap();
+    let usage = zeron_proto::SessionUsage {
+        input_tokens: Some(1000),
+        output_tokens: Some(50),
+        cached_input_tokens: Some(800),
+    };
     let core = assemble(
         dir.path(),
         Arc::new(ScriptedHarness {
@@ -2314,21 +2397,20 @@ async fn context_usage_settles_after_done_without_reopening_the_turn() {
                 AgentEvent::TextDelta {
                     text: "Finished".into(),
                 },
-                AgentEvent::ContextUsage {
-                    tokens: Some(64000),
-                    window: Some(200000),
-                },
                 done(DoneStatus::Completed),
+                AgentEvent::SessionUsage { usage },
                 AgentEvent::Subagent {
                     parent_tool_use_id: "child".into(),
-                    event: Box::new(AgentEvent::ContextUsage {
-                        tokens: Some(999999),
-                        window: Some(1000000),
+                    event: Box::new(AgentEvent::SessionUsage {
+                        usage: zeron_proto::SessionUsage {
+                            input_tokens: Some(999999),
+                            ..usage
+                        },
                     }),
                 },
                 AgentEvent::ContextUsage {
                     tokens: Some(0),
-                    window: None,
+                    window: Some(200000),
                 },
             ],
             step_delay: Duration::from_millis(20),
@@ -2338,10 +2420,10 @@ async fn context_usage_settles_after_done_without_reopening_the_turn() {
     let handle = core.doc_host.open(CHAT).unwrap();
     queue_as_viewer(
         handle.doc(),
-        "context-run",
+        "session-usage-run",
         SessionCommandPayload::Run {
-            request: run_request("measure context"),
-            message_id: "context-user".into(),
+            request: run_request("measure session usage"),
+            message_id: "session-usage-user".into(),
         },
     );
     wait_for(
@@ -2351,16 +2433,10 @@ async fn context_usage_settles_after_done_without_reopening_the_turn() {
                 .context_usage()
                 .is_some_and(|u| u.tokens == Some(0))
         },
-        "post-turn context update",
+        "usage updates after Done",
     )
     .await;
-    assert_eq!(
-        handle.doc().context_usage(),
-        Some(zeron_proto::ContextUsage {
-            tokens: Some(0),
-            window: Some(200000)
-        })
-    );
+    assert_eq!(handle.doc().session_usage(), Some(usage));
     assert_eq!(
         core.sessions.session_status(CHAT).map(|s| s.status),
         Some(SessionStatus::Idle)

@@ -31,11 +31,26 @@ impl TurnWire {
         Self::start_policy(queued, v2, true, None).await
     }
 
+    async fn start_resume_proto(v2: bool, history: Value) -> Self {
+        Self::start_policy_with(false, v2, true, None, Some("fixture"), Some(history)).await
+    }
+
     async fn start_policy(
         queued: bool,
         v2: bool,
         auto_approve: bool,
         answer: Option<bool>,
+    ) -> Self {
+        Self::start_policy_with(queued, v2, auto_approve, answer, None, None).await
+    }
+
+    async fn start_policy_with(
+        queued: bool,
+        v2: bool,
+        auto_approve: bool,
+        answer: Option<bool>,
+        resume: Option<&str>,
+        history: Option<Value>,
     ) -> Self {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -45,6 +60,7 @@ impl TurnWire {
         let (request_tx, requests) = mpsc::unbounded_channel();
         let posts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = posts.clone();
+        let history = history.unwrap_or_else(|| json!([]));
         let server = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             loop {
@@ -52,6 +68,7 @@ impl TurnWire {
                 let bus_rx = bus_rx.clone();
                 let request_tx = request_tx.clone();
                 let recorded = recorded.clone();
+                let history = history.clone();
                 connections.spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0; 4096];
@@ -84,22 +101,32 @@ impl TurnWire {
                         }
                         return;
                     }
-                    let body = if v2 {
+                    let body = if path == "/session/fixture/message"
+                        || path == "/api/session/fixture/message"
+                    {
+                        history.to_string()
+                    } else if v2 && path == "/api/session/fixture" {
+                        history.to_string()
+                    } else if v2 {
                         match path.as_str() {
                             "/api/health" => r#"{"healthy":true,"version":"2.0.3"}"#,
                             "/api/session" => r#"{"data":{"id":"fixture"}}"#,
+                            "/api/session/fixture" => r#"{"data":{"id":"fixture"}}"#,
                             "/api/command" => r#"{"data":[]}"#,
                             // Non-empty: the catalog-sync retry loop must not stall tests.
                             "/api/model" => r#"{"data":[{"providerID":"opencode","id":"muse","name":"Muse","limit":{"context":1000},"variants":[{"id":"low"}],"enabled":true}]}"#,
                             _ => "{}",
                         }
+                        .to_owned()
                     } else {
                         match path.as_str() {
                             "/global/health" => r#"{"healthy":true,"version":"1.18.31"}"#,
                             "/session" => r#"{"id":"fixture"}"#,
+                            "/session/fixture" => r#"{"id":"fixture"}"#,
                             "/command" => "[]",
                             _ => "{}",
                         }
+                        .to_owned()
                     };
                     socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
                     if path.ends_with("/prompt_async")
@@ -142,7 +169,7 @@ impl TurnWire {
                 interrupt: interrupt.clone(),
             },
             request: serde_json::from_value(
-                json!({"prompt":"first", "cwd":"", "sandbox":"workspace-write", "autoApprove": auto_approve, "model": if v2 { Some("opencode/muse") } else { None }, "reasoning": "low"}),
+                json!({"prompt":"first", "cwd":"", "sandbox":"workspace-write", "autoApprove": auto_approve, "model": if v2 { Some("opencode/muse") } else { None }, "reasoning": "low", "resume": resume}),
             )
             .unwrap(),
             interrupt_grace: Duration::from_secs(2),
@@ -284,11 +311,8 @@ async fn v2_wire_streams_text_and_settles_on_execution_success() {
         loop {
             match wire.events.recv().await.unwrap().unwrap() {
                 AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
-                AgentEvent::Usage {
-                    input_tokens,
-                    output_tokens,
-                } => {
-                    usage = Some((input_tokens, output_tokens));
+                AgentEvent::SessionUsage { usage: snapshot } => {
+                    usage = Some(snapshot);
                 }
                 AgentEvent::Done { status, .. } => return (status, text, usage),
                 _ => {}
@@ -299,7 +323,14 @@ async fn v2_wire_streams_text_and_settles_on_execution_success() {
     .unwrap();
     assert_eq!(status, DoneStatus::Completed);
     assert_eq!(text, "PONG");
-    assert_eq!(usage, Some((10, 2)));
+    assert_eq!(
+        usage,
+        Some(SessionUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            cached_input_tokens: Some(0),
+        })
+    );
 }
 
 #[tokio::test]
@@ -1013,7 +1044,8 @@ fn v2_frames_normalize_to_v1_payloads() {
             "type":"tool","tool":"read",
             "state":{"status":"running","input":{"path":"/tmp/x"}}}}})]
     );
-    // Usage totals reach the engine as an assistant message.updated.
+    // Usage totals reach the engine as a dedicated cumulative event; they are
+    // not an assistant message and must not enter the context feed.
     let out = normalize_v2_frame(
         json!({"id":"evt_9","type":"session.usage.updated","data":{
             "sessionID":"ses_1","cost":0,
@@ -1022,10 +1054,10 @@ fn v2_frames_normalize_to_v1_payloads() {
     );
     assert_eq!(
         out,
-        vec![json!({"type":"message.updated","properties":{
-            "info":{"sessionID":"ses_1","id":"usage","role":"assistant",
-                    "tokens":{"input":10,"output":2,"reasoning":0,
-                              "cache":{"read":0,"write":0}}}}})]
+        vec![json!({"type":"session.usage.updated","properties":{
+            "sessionID":"ses_1",
+            "tokens":{"input":10,"output":2,"reasoning":0,
+                       "cache":{"read":0,"write":0}}}})]
     );
     // The permission ask keeps its 1.x name on 2.x (observed live when a
     // tool reaches outside the workspace); the auto-approver replies.
@@ -1382,4 +1414,266 @@ async fn v2_recovered_step_failure_does_not_poison_successful_execution() {
     let (status, text) = wire.done().await;
     assert_eq!(status, DoneStatus::Completed);
     assert_eq!(text, "Recovered");
+}
+
+#[test]
+fn v1_session_usage_deduplicates_messages_and_counts_cache_input() {
+    let mut state = SessionUsageState::new(Protocol::V1, true);
+    let placeholder = json!({
+        "sessionID": "main",
+        "id": "m1",
+        "role": "assistant",
+        "time": {"created": 1},
+        "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                    "cache": {"read": 0, "write": 0}}
+    });
+    assert_eq!(state.apply_message("main", &placeholder), None);
+
+    let settled = json!({
+        "sessionID": "main",
+        "id": "m1",
+        "role": "assistant",
+        "time": {"created": 1, "completed": 2},
+        "tokens": {"input": 10, "output": 2, "reasoning": 7,
+                    "cache": {"read": 30, "write": 5}}
+    });
+    assert_eq!(
+        state.apply_message("main", &settled),
+        Some(SessionUsage {
+            input_tokens: Some(45),
+            output_tokens: Some(2),
+            cached_input_tokens: Some(30),
+        })
+    );
+    assert_eq!(
+        state.apply_message("main", &settled),
+        None,
+        "repeated message.updated snapshots do not add usage again"
+    );
+
+    let child = json!({
+        "sessionID": "child",
+        "id": "child-m",
+        "role": "assistant",
+        "time": {"created": 3, "completed": 4},
+        "tokens": {"input": 1000, "output": 1000,
+                    "cache": {"read": 1000, "write": 1000}}
+    });
+    assert_eq!(state.apply_message("main", &child), None);
+    assert_eq!(
+        state.snapshot(),
+        Some(SessionUsage {
+            input_tokens: Some(45),
+            output_tokens: Some(2),
+            cached_input_tokens: Some(30),
+        })
+    );
+}
+
+#[test]
+fn missing_cache_stays_unknown_and_settled_usage_survives_empty_revision() {
+    let mut state = SessionUsageState::new(Protocol::V1, true);
+    let settled = json!({
+        "sessionID": "main",
+        "id": "m1",
+        "role": "assistant",
+        "time": {"completed": 2},
+        "tokens": {"input": 10, "output": 2}
+    });
+    let empty_revision = json!({
+        "sessionID": "main",
+        "id": "m1",
+        "role": "assistant",
+        "time": {"created": 1},
+        "tokens": {"input": 0, "output": 0}
+    });
+    state.apply_message("main", &settled);
+    assert_eq!(state.apply_message("main", &empty_revision), None);
+    assert_eq!(
+        state.snapshot(),
+        Some(SessionUsage {
+            input_tokens: None,
+            output_tokens: Some(2),
+            cached_input_tokens: None,
+        })
+    );
+}
+
+#[test]
+fn v2_cumulative_usage_is_separate_from_message_history_and_reasoning() {
+    let mut state = SessionUsageState::new(Protocol::V2, true);
+    assert_eq!(state.snapshot(), None);
+
+    let cumulative = json!({
+        "sessionID": "main",
+        "tokens": {"input": 100, "output": 4, "reasoning": 50,
+                    "cache": {"read": 20, "write": 5}}
+    });
+    assert_eq!(
+        state.apply_cumulative("main", &cumulative),
+        Some(SessionUsage {
+            input_tokens: Some(125),
+            output_tokens: Some(4),
+            cached_input_tokens: Some(20),
+        })
+    );
+    assert_eq!(state.apply_cumulative("main", &cumulative), None);
+    assert_eq!(
+        state.snapshot(),
+        Some(SessionUsage {
+            input_tokens: Some(125),
+            output_tokens: Some(4),
+            cached_input_tokens: Some(20),
+        })
+    );
+}
+
+#[tokio::test]
+async fn v1_resume_restores_history_before_adding_current_messages() {
+    let mut wire = TurnWire::start_resume_proto(
+        false,
+        json!([{
+            "info": {
+                "sessionID": "fixture",
+                "id": "old",
+                "role": "assistant",
+                "time": {"created": 1, "completed": 2},
+                "tokens": {"input": 10, "output": 2, "reasoning": 20,
+                            "cache": {"read": 30, "write": 5}}
+            },
+            "parts": []
+        }]),
+    )
+    .await;
+    wire.request("/prompt_async").await;
+    wire.status("busy");
+    wire.bus
+        .send(json!({"type":"message.updated","properties":{"info":{
+            "sessionID":"fixture","id":"current","role":"assistant",
+            "time":{"created":3},
+            "tokens":{"input":0,"output":0,"reasoning":0,
+                       "cache":{"read":0,"write":0}}
+        }}}))
+        .unwrap();
+    wire.bus
+        .send(json!({"type":"message.updated","properties":{"info":{
+            "sessionID":"fixture","id":"current","role":"assistant",
+            "time":{"created":3,"completed":4},
+            "tokens":{"input":4,"output":3,"reasoning":8,
+                       "cache":{"read":6,"write":1}}
+        }}}))
+        .unwrap();
+    wire.idle();
+
+    let snapshots = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut snapshots = Vec::new();
+        loop {
+            match wire.events.recv().await.unwrap().unwrap() {
+                AgentEvent::SessionUsage { usage } => snapshots.push(usage),
+                AgentEvent::Done { .. } => return snapshots,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        snapshots,
+        vec![
+            SessionUsage {
+                input_tokens: Some(45),
+                output_tokens: Some(2),
+                cached_input_tokens: Some(30),
+            },
+            SessionUsage {
+                input_tokens: Some(56),
+                output_tokens: Some(5),
+                cached_input_tokens: Some(36),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn v2_resume_totals_are_replaced_by_absolute_usage_without_double_counting() {
+    let mut wire = TurnWire::start_resume_proto(
+        true,
+        json!({"data":{
+            "id": "fixture",
+            "tokens": {"input": 10, "output": 2,
+                        "cache": {"read": 30, "write": 5}}
+        }}),
+    )
+    .await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    wire.v2("session.execution.started", json!({"sessionID":"fixture"}));
+    let cumulative = json!({
+        "sessionID":"fixture",
+        "cost":0,
+        "tokens":{"input":100,"output":4,"reasoning":50,
+                   "cache":{"read":20,"write":5}}
+    });
+    wire.v2("session.usage.updated", cumulative.clone());
+    wire.v2("session.usage.updated", cumulative);
+    wire.v2(
+        "session.execution.succeeded",
+        json!({"sessionID":"fixture"}),
+    );
+
+    let snapshots = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut snapshots = Vec::new();
+        loop {
+            match wire.events.recv().await.unwrap().unwrap() {
+                AgentEvent::SessionUsage { usage } => snapshots.push(usage),
+                AgentEvent::Done { .. } => return snapshots,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        snapshots,
+        vec![
+            SessionUsage {
+                input_tokens: Some(45),
+                output_tokens: Some(2),
+                cached_input_tokens: Some(30),
+            },
+            SessionUsage {
+                input_tokens: Some(125),
+                output_tokens: Some(4),
+                cached_input_tokens: Some(20),
+            },
+        ]
+    );
+}
+
+#[test]
+fn v1_partial_history_keeps_each_missing_total_unknown() {
+    let mut state = SessionUsageState::new(Protocol::V1, false);
+    state.restore_messages(
+        "main",
+        &[
+            json!({"info":{"id":"one","role":"assistant","time":{"completed":1},
+            "tokens":{"input":10,"output":2,"cache":{"read":20,"write":0}}}}),
+            json!({"info":{"id":"two","role":"assistant","time":{"completed":2},
+            "tokens":{"input":3,"cache":{"read":4,"write":0}}}}),
+        ],
+    );
+    state.authoritative = true;
+    assert_eq!(
+        state.snapshot(),
+        Some(SessionUsage {
+            input_tokens: Some(37),
+            output_tokens: None,
+            cached_input_tokens: Some(24),
+        })
+    );
+    state.restore_messages(
+        "main",
+        &[json!({"info":{"id":"three","role":"assistant","time":{"completed":3}}})],
+    );
+    assert_eq!(state.snapshot(), Some(SessionUsage::default()));
 }

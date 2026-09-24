@@ -4,7 +4,7 @@ use gpui::{
     Context, IntoElement, PathBuilder, Render, SharedString, Window, canvas, div, point,
     prelude::*, px,
 };
-use zeron_proto::ContextUsage;
+use zeron_proto::{ContextUsage, SessionUsage};
 
 pub fn render(
     usage: Option<ContextUsage>,
@@ -94,73 +94,78 @@ fn with_separators(count: u64) -> String {
     grouped
 }
 
-/// whether the indicator has anything to measure against: harnesses that
-/// never report a window (antigravity) get no indicator at all, rather than a
-/// permanently empty ring.
+/// Whether the context ring has a reported window to measure against.
 pub fn has_window(usage: Option<ContextUsage>) -> bool {
     usage
         .and_then(|usage| usage.window)
         .is_some_and(|window| window > 0)
 }
 
-fn details(usage: Option<ContextUsage>) -> String {
-    match usage.unwrap_or_default() {
-        ContextUsage {
-            tokens: Some(tokens),
-            window: Some(window),
-        } if window > 0 => {
-            format!(
-                "{} / {} tokens\n{} tokens remaining",
-                with_separators(tokens),
-                with_separators(window),
-                with_separators(window.saturating_sub(tokens))
-            )
-        }
-        ContextUsage {
-            tokens: Some(tokens),
-            ..
-        } => format!(
-            "{} tokens used\nContext limit not reported",
-            with_separators(tokens)
-        ),
-        ContextUsage {
-            window: Some(window),
-            ..
-        } if window > 0 => format!(
-            "{} token capacity\nWaiting for context usage",
-            with_separators(window)
-        ),
-        _ => "Context usage not reported by this harness yet".into(),
-    }
+/// Whether the footer should show the indicator and its session usage card.
+/// Session usage can be available even when a harness does not report a
+/// context window, in which case the indicator keeps its dash label.
+pub fn has_any_usage(
+    context_usage: Option<ContextUsage>,
+    session_usage: Option<SessionUsage>,
+) -> bool {
+    has_window(context_usage) || session_usage.is_some()
+}
+
+fn token_value(value: Option<u64>) -> String {
+    value.map(with_separators).unwrap_or_else(|| "—".into())
+}
+
+fn cache_hit_rate_value(usage: Option<SessionUsage>) -> String {
+    usage
+        .and_then(|usage| usage.cache_hit_rate())
+        .map(|rate| format!("{:.1}%", rate * 100.0))
+        .unwrap_or_else(|| "—".into())
+}
+
+fn metric_row(label: &'static str, value: String, theme: &Theme) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(24.0))
+        .child(
+            div()
+                .text_color(theme.text_muted)
+                .child(SharedString::from(label)),
+        )
+        .child(
+            div()
+                .text_right()
+                .text_color(theme.text)
+                .child(SharedString::from(value)),
+        )
 }
 
 impl Render for UsageCard {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &Theme::of(cx).for_popup();
+        let session_usage = self.state.read(cx).session_usage;
         let card = crate::popover::popover_card(theme)
             .p(px(12.0))
             .flex()
             .flex_col()
-            .gap(px(8.0))
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text)
-                    .child("Context window"),
-            )
-            .child(
-                // the lines break only at their own newlines: a tooltip sizes
-                // from the unwrapped text, so soft wrapping clipped the last line
-                div()
-                    .text_size(px(12.0))
-                    .line_height(px(19.0))
-                    .whitespace_nowrap()
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(details(
-                        self.state.read(cx).context_usage,
-                    ))),
-            );
+            .gap(px(6.0))
+            .text_size(px(12.0))
+            .line_height(px(19.0))
+            .whitespace_nowrap()
+            .children([
+                metric_row(
+                    "Input tokens",
+                    token_value(session_usage.and_then(|usage| usage.input_tokens)),
+                    theme,
+                ),
+                metric_row(
+                    "Output tokens",
+                    token_value(session_usage.and_then(|usage| usage.output_tokens)),
+                    theme,
+                ),
+                metric_row("Cache hit rate", cache_hit_rate_value(session_usage), theme),
+            ]);
         crate::frost::frosted(crate::popover::CARD_RADIUS, crate::frost::MENU_BLUR, card)
     }
 }
@@ -186,29 +191,16 @@ mod tests {
     }
 
     #[test]
-    fn missing_usage_is_distinct_from_zero_and_overflow() {
-        assert!(details(None).contains("not reported"));
-        assert!(
-            details(Some(ContextUsage {
-                tokens: Some(0),
-                window: Some(200)
-            }))
-            .contains("200 tokens remaining")
-        );
-        assert!(
-            details(Some(ContextUsage {
-                tokens: Some(250),
-                window: Some(200)
-            }))
-            .contains("0 tokens remaining")
-        );
-        assert!(
-            details(Some(ContextUsage {
-                tokens: Some(10),
-                window: Some(0)
-            }))
-            .contains("limit not reported")
-        );
+    fn session_usage_without_context_still_shows_indicator() {
+        assert!(!has_any_usage(None, None));
+        assert!(has_any_usage(
+            Some(ContextUsage {
+                tokens: None,
+                window: Some(200_000),
+            }),
+            None,
+        ));
+        assert!(has_any_usage(None, Some(SessionUsage::default())));
     }
 
     #[test]
@@ -217,12 +209,42 @@ mod tests {
         assert_eq!(with_separators(999), "999");
         assert_eq!(with_separators(5417), "5,417");
         assert_eq!(with_separators(1_048_576), "1,048,576");
+        assert_eq!(token_value(Some(1_048_576)), "1,048,576");
+    }
+
+    #[test]
+    fn session_usage_values_show_dashes_until_reported() {
+        assert_eq!(token_value(None), "—");
+        assert_eq!(token_value(Some(0)), "0");
+        assert_eq!(token_value(Some(1_048_576)), "1,048,576");
+        assert_eq!(cache_hit_rate_value(None), "—");
         assert_eq!(
-            details(Some(ContextUsage {
-                tokens: Some(5417),
-                window: Some(1_048_576)
+            cache_hit_rate_value(Some(SessionUsage {
+                input_tokens: Some(0),
+                output_tokens: Some(4),
+                cached_input_tokens: Some(0),
             })),
-            "5,417 / 1,048,576 tokens\n1,043,159 tokens remaining"
+            "—"
+        );
+    }
+
+    #[test]
+    fn session_usage_cache_hit_rate_is_formatted_as_percent() {
+        assert_eq!(
+            cache_hit_rate_value(Some(SessionUsage {
+                input_tokens: Some(1_000),
+                output_tokens: Some(50),
+                cached_input_tokens: Some(800),
+            })),
+            "80.0%"
+        );
+        assert_eq!(
+            cache_hit_rate_value(Some(SessionUsage {
+                input_tokens: Some(1_000),
+                output_tokens: Some(50),
+                cached_input_tokens: Some(1_001),
+            })),
+            "—"
         );
     }
 }

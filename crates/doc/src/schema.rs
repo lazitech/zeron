@@ -341,8 +341,53 @@ impl SessionDoc {
         Ok(())
     }
 
+    /// Replace an exact native snapshot. Unknown fields clear stale values,
+    /// including occupancy immediately after compaction or a missing model.
+    pub fn replace_context_usage(&self, usage: zeron_proto::ContextUsage) -> Result<(), DocError> {
+        let previous = self.context_usage();
+        let next = zeron_proto::ContextUsage {
+            tokens: usage.tokens,
+            window: usage.window.filter(|n| *n > 0),
+        };
+        if Some(next) != previous {
+            self.doc
+                .get_map("meta")
+                .insert("contextUsage", serde_json::to_string(&next)?)?;
+            self.doc.commit();
+        }
+        Ok(())
+    }
+
     pub fn clear_context_usage(&self) -> Result<(), DocError> {
         self.doc.get_map("meta").delete("contextUsage")?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// Absolute native-session counters, separate from context occupancy.
+    pub fn session_usage(&self) -> Option<zeron_proto::SessionUsage> {
+        let loro::ValueOrContainer::Value(LoroValue::String(value)) =
+            self.doc.get_map("meta").get("sessionUsage")?
+        else {
+            return None;
+        };
+        serde_json::from_str(&value).ok()
+    }
+
+    /// Replace the whole snapshot: retaining an old cache count while input
+    /// advances would manufacture a cache hit rate the provider did not report.
+    pub fn update_session_usage(&self, usage: zeron_proto::SessionUsage) -> Result<(), DocError> {
+        if self.session_usage() != Some(usage) {
+            self.doc
+                .get_map("meta")
+                .insert("sessionUsage", serde_json::to_string(&usage)?)?;
+            self.doc.commit();
+        }
+        Ok(())
+    }
+
+    pub fn clear_session_usage(&self) -> Result<(), DocError> {
+        self.doc.get_map("meta").delete("sessionUsage")?;
         self.doc.commit();
         Ok(())
     }
@@ -1980,6 +2025,49 @@ mod tests {
 mod context_usage_tests {
     use super::*;
     #[test]
+    fn session_usage_replaces_snapshots_and_survives_import_and_rebuild() {
+        let host = SessionDoc::init("session-usage-chat").unwrap();
+        assert_eq!(host.session_usage(), None);
+        let usage = zeron_proto::SessionUsage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(50_000),
+            cached_input_tokens: Some(800_000),
+        };
+        host.update_session_usage(usage).unwrap();
+        let version = host.doc().oplog_vv();
+        host.update_session_usage(usage).unwrap();
+        assert_eq!(
+            host.doc().oplog_vv(),
+            version,
+            "duplicate reports are no-ops"
+        );
+        let replica = SessionDoc::from_doc(LoroDoc::new());
+        replica
+            .doc()
+            .import(&host.export_snapshot().unwrap())
+            .unwrap();
+        assert_eq!(replica.session_usage(), Some(usage));
+
+        // A new snapshot must not borrow the previous cached count.
+        let next = zeron_proto::SessionUsage {
+            input_tokens: Some(1_100_000),
+            output_tokens: Some(60_000),
+            cached_input_tokens: None,
+        };
+        host.update_session_usage(next).unwrap();
+        replica
+            .doc()
+            .import(&host.doc().export(ExportMode::updates(&version)).unwrap())
+            .unwrap();
+        assert_eq!(replica.session_usage(), Some(next));
+        assert_eq!(replica.session_usage().unwrap().cache_hit_rate(), None);
+        let rebuilt = crate::rebuild_thin_doc(&replica).unwrap().doc;
+        assert_eq!(rebuilt.session_usage(), Some(next));
+        rebuilt.clear_session_usage().unwrap();
+        assert_eq!(rebuilt.session_usage(), None);
+    }
+
+    #[test]
     fn context_snapshot_survives_remote_import_restart_and_rebuild() {
         let host = SessionDoc::init("context-chat").unwrap();
         assert_eq!(host.context_usage(), None);
@@ -2011,5 +2099,44 @@ mod context_usage_tests {
         assert_eq!(rebuilt.context_usage(), host.context_usage());
         rebuilt.clear_context_usage().unwrap();
         assert_eq!(rebuilt.context_usage(), None);
+    }
+
+    #[test]
+    fn exact_context_snapshot_clears_unknown_tokens_then_accepts_new_value() {
+        let doc = SessionDoc::init("context-exact-chat").unwrap();
+        let known = zeron_proto::ContextUsage {
+            tokens: Some(150_000),
+            window: Some(200_000),
+        };
+        doc.update_context_usage(known.tokens, known.window)
+            .unwrap();
+
+        // Native Pi reports an unknown occupancy immediately after compaction.
+        // The old count must not remain visible, while capacity remains usable.
+        doc.replace_context_usage(zeron_proto::ContextUsage {
+            tokens: None,
+            window: Some(200_000),
+        })
+        .unwrap();
+        assert_eq!(
+            doc.context_usage(),
+            Some(zeron_proto::ContextUsage {
+                tokens: None,
+                window: Some(200_000),
+            })
+        );
+
+        let next = zeron_proto::ContextUsage {
+            tokens: Some(65),
+            window: Some(128_000),
+        };
+        doc.replace_context_usage(next).unwrap();
+        assert_eq!(doc.context_usage(), Some(next));
+        doc.replace_context_usage(zeron_proto::ContextUsage::default())
+            .unwrap();
+        assert_eq!(
+            doc.context_usage(),
+            Some(zeron_proto::ContextUsage::default())
+        );
     }
 }

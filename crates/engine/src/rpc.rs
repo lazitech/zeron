@@ -1081,7 +1081,7 @@ fn doc_messages_stream(
             rx,
             None::<crate::doc_host::TranscriptSnapshot>,
             doc,
-            None,
+            (None, None),
             zeron_doc::TranscriptBaseline::default(),
         ),
         |(mut rx, mut prev, doc, mut previous_usage, mut opening_baseline)| async move {
@@ -1127,14 +1127,15 @@ fn doc_messages_stream(
                 prev = Some(current);
                 // No-op commits (a second watcher attaching, command-only
                 // changes) produce empty deltas — skip the frame entirely.
-                let usage = doc.context_usage();
+                let usage = (doc.context_usage(), doc.session_usage());
                 if frame.is_empty_delta() && usage == previous_usage && replay_baseline.is_none() {
                     continue;
                 }
                 previous_usage = usage;
                 let value = serde_json::to_value(zeron_doc::TranscriptUpdate {
                     frame,
-                    context_usage: usage,
+                    context_usage: usage.0,
+                    session_usage: usage.1,
                     replay_baseline,
                 })
                 .ok()?;
@@ -1157,6 +1158,7 @@ async fn opening_doc_messages_stream(
         let mut preview = serde_json::to_value(zeron_doc::TranscriptUpdate {
             frame: zeron_doc::TranscriptFrame::reset(&entries),
             context_usage: handle.doc().context_usage(),
+            session_usage: handle.doc().session_usage(),
             replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&entries)),
         })
         .map_err(|e| crate::EngineError::Other(e.to_string()))?;
@@ -3124,6 +3126,58 @@ mod context_usage_tests {
             "live plus recovered".len()
         );
         host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn session_usage_only_commits_reach_watch_and_reconnect() {
+        let host = zeron_doc::SessionDoc::init("session-usage-chat").unwrap();
+        let usage = zeron_proto::SessionUsage {
+            input_tokens: Some(1000),
+            output_tokens: Some(50),
+            cached_input_tokens: Some(800),
+        };
+        host.update_session_usage(usage).unwrap();
+        let remote = Arc::new(zeron_doc::SessionDoc::from_doc(loro::LoroDoc::new()));
+        remote
+            .doc()
+            .import(&host.export_snapshot().unwrap())
+            .unwrap();
+        let (tx, rx) = watch::channel(crate::doc_host::TranscriptSnapshot::default());
+        let mut stream = doc_messages_stream(rx, remote.clone());
+        let first = stream.next().await.unwrap();
+        assert_eq!(first["sessionUsage"]["inputTokens"], 1000);
+        assert!(first.get("reset").is_some());
+        let version = host.doc().oplog_vv();
+        host.update_session_usage(zeron_proto::SessionUsage {
+            input_tokens: Some(2000),
+            output_tokens: Some(100),
+            cached_input_tokens: Some(1600),
+        })
+        .unwrap();
+        remote
+            .doc()
+            .import(
+                &host
+                    .doc()
+                    .export(loro::ExportMode::updates(&version))
+                    .unwrap(),
+            )
+            .unwrap();
+        tx.send_replace(crate::doc_host::TranscriptSnapshot::default());
+        let update = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(update["sessionUsage"]["inputTokens"], 2000);
+        assert_eq!(update["sessionUsage"]["cachedInputTokens"], 1600);
+        let mut reconnect = doc_messages_stream(tx.subscribe(), remote.clone());
+        assert_eq!(
+            reconnect.next().await.unwrap()["sessionUsage"],
+            update["sessionUsage"]
+        );
+        remote.clear_session_usage().unwrap();
+        tx.send_replace(crate::doc_host::TranscriptSnapshot::default());
+        assert!(stream.next().await.unwrap()["sessionUsage"].is_null());
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@
 //! types) are accepted, and unknown item types map to nothing.
 
 use serde_json::Value;
-use zeron_proto::{AgentEvent, DoneStatus, TodoItem, ToolCall};
+use zeron_proto::{AgentEvent, DoneStatus, SessionUsage, TodoItem, ToolCall};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -135,6 +135,23 @@ pub(crate) fn usage_event(params: &Value) -> Option<AgentEvent> {
         input_tokens: count(&["inputTokens", "input_tokens"]),
         output_tokens: count(&["outputTokens", "output_tokens"]),
     })
+}
+
+/// `thread/tokenUsage/updated` → an absolute cumulative session usage
+/// snapshot. This intentionally reads `total`, never `last`: the latter is
+/// the current turn's usage and remains the source for [`usage_event`].
+pub(crate) fn session_usage_event(params: &Value) -> Option<AgentEvent> {
+    let total = field(params, &["tokenUsage", "token_usage"])?.get("total")?;
+    let count = |keys: &[&str]| field(total, keys).and_then(Value::as_u64);
+    let usage = SessionUsage {
+        input_tokens: count(&["inputTokens", "input_tokens"]),
+        output_tokens: count(&["outputTokens", "output_tokens"]),
+        cached_input_tokens: count(&["cachedInputTokens", "cached_input_tokens"]),
+    };
+    (usage.input_tokens.is_some()
+        || usage.output_tokens.is_some()
+        || usage.cached_input_tokens.is_some())
+    .then_some(AgentEvent::SessionUsage { usage })
 }
 
 pub(crate) fn context_usage_event(params: &Value) -> Option<AgentEvent> {
@@ -858,6 +875,107 @@ mod tests {
             })
         );
         assert_eq!(usage_event(&json!({})), None);
+    }
+
+    #[test]
+    fn session_usage_reads_cumulative_total_and_never_last() {
+        assert_eq!(
+            session_usage_event(&json!({
+                "tokenUsage": {
+                    "last": {"inputTokens": 3, "outputTokens": 4},
+                    "total": {"inputTokens": 420, "outputTokens": 70, "cachedInputTokens": 400}
+                }
+            })),
+            Some(AgentEvent::SessionUsage {
+                usage: SessionUsage {
+                    input_tokens: Some(420),
+                    output_tokens: Some(70),
+                    cached_input_tokens: Some(400)
+                }
+            })
+        );
+        assert_eq!(
+            session_usage_event(&json!({
+                "tokenUsage": {"last": {"inputTokens": 3, "outputTokens": 4}}
+            })),
+            None,
+            "a last-turn-only update is not a cumulative session snapshot"
+        );
+        assert_eq!(
+            session_usage_event(&json!({"tokenUsage": {"total": {}}})),
+            None,
+            "an empty cumulative object carries no session usage"
+        );
+        assert_eq!(
+            session_usage_event(&json!({
+                "tokenUsage": {"total": {"inputTokens": "not-a-number"}}
+            })),
+            None,
+            "malformed totals are ignored"
+        );
+    }
+
+    #[test]
+    fn session_usage_accepts_snake_case_and_preserves_missing_or_zero_cache() {
+        assert_eq!(
+            session_usage_event(&json!({
+                "token_usage": {
+                    "total": {"input_tokens": 100, "output_tokens": 20}
+                }
+            })),
+            Some(AgentEvent::SessionUsage {
+                usage: SessionUsage {
+                    input_tokens: Some(100),
+                    output_tokens: Some(20),
+                    cached_input_tokens: None
+                }
+            })
+        );
+        let zero_cache = session_usage_event(&json!({
+            "tokenUsage": {
+                "total": {"inputTokens": 100, "outputTokens": 20, "cachedInputTokens": 0}
+            }
+        }));
+        assert_eq!(
+            zero_cache,
+            Some(AgentEvent::SessionUsage {
+                usage: SessionUsage {
+                    input_tokens: Some(100),
+                    output_tokens: Some(20),
+                    cached_input_tokens: Some(0)
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn session_usage_snapshots_are_absolute() {
+        let first = session_usage_event(&json!({
+            "tokenUsage": {"total": {"inputTokens": 100}}
+        }));
+        let second = session_usage_event(&json!({
+            "tokenUsage": {"total": {"inputTokens": 150}}
+        }));
+        assert_eq!(
+            first,
+            Some(AgentEvent::SessionUsage {
+                usage: SessionUsage {
+                    input_tokens: Some(100),
+                    output_tokens: None,
+                    cached_input_tokens: None
+                }
+            })
+        );
+        assert_eq!(
+            second,
+            Some(AgentEvent::SessionUsage {
+                usage: SessionUsage {
+                    input_tokens: Some(150),
+                    output_tokens: None,
+                    cached_input_tokens: None
+                }
+            })
+        );
     }
 
     #[test]
