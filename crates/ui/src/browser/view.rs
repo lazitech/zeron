@@ -625,6 +625,20 @@ impl Render for BrowserSurface {
                 });
         div().id("browser-surface").size_full().flex().flex_col().track_focus(&self.focus)
             .key_context("Browser").on_key_down(cx.listener(Self::key_down))
+            .on_mouse_down(
+                MouseButton::Navigate(gpui::NavigationDirection::Back),
+                cx.listener(|this, _, _, cx| {
+                    this.history(false);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(gpui::NavigationDirection::Forward),
+                cx.listener(|this, _, _, cx| {
+                    this.history(true);
+                    cx.stop_propagation();
+                }),
+            )
             .on_key_up(cx.listener(|this,event: &gpui::KeyUpEvent,w,cx| {
                 #[cfg(target_os = "linux")]
                 if this.focus.is_focused(w) {this.linux_key(&event.keystroke,false);cx.stop_propagation();}

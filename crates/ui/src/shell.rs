@@ -746,12 +746,13 @@ fn sidebar_faded_label(id: SharedString, fill: bool, label: impl IntoElement) ->
 /// [`gpui::EdgeFade`] scope — per-primitive, so text fades per glyph).
 const SIDEBAR_GLASS_FADE_BAND: f32 = 24.0;
 
-/// New-thread controls float over the tail of a top-anchored image hero. The
-/// hero reaches below the composer, giving its lower mask room to dissolve
-/// gradually into the otherwise empty lower canvas.
-const NEW_THREAD_BACKGROUND_FROSTED_OPACITY: f32 = 0.84;
-const NEW_THREAD_BACKGROUND_VIEWPORT_RATIO: f32 = 0.72;
-const NEW_THREAD_BACKGROUND_MAX_HEIGHT: f32 = 760.0;
+/// New-thread controls float over a full-bleed image hero. The hero spans the
+/// whole conversation canvas and the artwork is painted at full strength: the
+/// fade/cutout mask is disabled (`new_thread_background_mask::mask` returns a
+/// zero-feather mask), so neither a top band nor the frosted dimming crops or
+/// dissolves the image.
+const NEW_THREAD_BACKGROUND_FROSTED_OPACITY: f32 = 1.0;
+const NEW_THREAD_BACKGROUND_VIEWPORT_RATIO: f32 = 1.0;
 
 /// Drag marker for the sidebar resize handle.
 struct SidebarResize;
@@ -1006,8 +1007,7 @@ fn new_thread_background_opacity(is_frost: bool) -> f32 {
 }
 
 fn new_thread_background_height(viewport_height: f32) -> f32 {
-    (viewport_height.max(0.0) * NEW_THREAD_BACKGROUND_VIEWPORT_RATIO)
-        .min(NEW_THREAD_BACKGROUND_MAX_HEIGHT)
+    viewport_height.max(0.0) * NEW_THREAD_BACKGROUND_VIEWPORT_RATIO
 }
 
 fn new_thread_background(
@@ -10719,6 +10719,16 @@ impl Render for Shell {
                     }
                 }),
             )
+            // App-level fallback; BrowserSurface consumes these over its own
+            // surface so browser history wins there.
+            .on_mouse_down(
+                MouseButton::Navigate(gpui::NavigationDirection::Back),
+                cx.listener(|this, _, _, cx| this.navigate_back(cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(gpui::NavigationDirection::Forward),
+                cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
+            )
             .capture_key_down(cx.listener(Self::on_key_down_capture))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
@@ -11285,11 +11295,12 @@ mod tests {
             new_thread_background_opacity(true),
             NEW_THREAD_BACKGROUND_FROSTED_OPACITY
         );
-        assert_eq!(new_thread_background_height(400.0), 288.0);
-        assert!((new_thread_background_height(600.0) - 432.0).abs() < 0.001);
-        assert_eq!(new_thread_background_height(1_000.0), 720.0);
-        assert_eq!(new_thread_background_height(1_200.0), 760.0);
-        assert!(new_thread_background_height(848.0) > 848.0 / 2.0);
+        // Full-bleed hero: the whole viewport height, no 760px cap.
+        assert_eq!(new_thread_background_height(400.0), 400.0);
+        assert_eq!(new_thread_background_height(600.0), 600.0);
+        assert_eq!(new_thread_background_height(1_000.0), 1_000.0);
+        assert_eq!(new_thread_background_height(1_200.0), 1_200.0);
+        assert_eq!(new_thread_background_height(848.0), 848.0);
     }
 
     #[test]

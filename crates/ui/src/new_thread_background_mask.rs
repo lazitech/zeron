@@ -1,5 +1,13 @@
 //! Paint-time source-alpha feather. Resizing changes only GPU parameters, not
 //! the image identity, pixels, atlas entry, or an asynchronous raster job.
+//!
+//! The full-bleed new-thread wallpaper runs with a zero-feather mask, which the
+//! shader short-circuits (`image_mask_alpha` returns 1.0 when `feather <= 0.0`).
+//! That intentionally disables both the bottom fade and the composer cutout, so
+//! the artwork fills the whole hero at full strength. `bounds`, `radius`,
+//! `clearance` and `bottom_fade` are still produced for geometry tests but never
+//! reach the shader. Re-enabling the fade/cutout means restoring the non-zero
+//! feather expressions below.
 use gpui::{Bounds, ImageAlphaMask, Pixels, RenderImage, Window, point, px, size};
 use std::{cell::Cell, rc::Rc, sync::Arc};
 
@@ -33,11 +41,11 @@ fn mask(bounds: Bounds<Pixels>, composer: Bounds<Pixels>, cutout: bool) -> Image
         } else {
             px(0.0)
         },
-        feather: if cutout {
-            px((height * 0.52).clamp(120.0, 280.0))
-        } else {
-            px(1.0)
-        },
+        // Zero feather = the whole mask is disabled (no bottom fade, no
+        // composer cutout) so the wallpaper stays full-bleed. The value used
+        // to be `(height * 0.52).clamp(120.0, 280.0)` for the cutout pass and
+        // `1.0` for the reveal pass.
+        feather: px(0.0),
         clearance: if cutout { px(8.0) } else { px(0.0) },
         // Start fading at the image's top, rather than holding full opacity
         // through its first 40% and compressing the transition near the bottom.
@@ -191,7 +199,7 @@ mod tests {
                 let mask = mask(hero, composer, true);
                 assert_eq!(mask.bounds, composer);
                 assert_eq!(mask.bottom_fade, Some((px(480.0), px(440.0))));
-                assert_eq!(mask.feather, px(440.0 * 0.52));
+                assert_eq!(mask.feather, px(0.0));
                 assert_eq!(mask.clearance, px(8.0));
             }
         }
@@ -205,7 +213,7 @@ mod tests {
         assert_eq!(mask.bounds.origin, composer.origin);
         assert_eq!(mask.bounds.size.width, composer.size.width);
         assert_eq!(mask.bounds.bottom(), hero.bottom());
-        assert_eq!(mask.feather, px(280.0));
+        assert_eq!(mask.feather, px(0.0));
     }
     #[test]
     fn new_thread_cutout_reveal_preserves_the_bottom_fade_and_image_extent() {

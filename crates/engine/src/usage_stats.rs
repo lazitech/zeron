@@ -116,6 +116,8 @@ struct Turn {
 struct DayAccumulator {
     sessions: u64,
     prompts: u64,
+    tokens: u64,
+    has_token_data: bool,
 }
 
 #[derive(Default)]
@@ -341,6 +343,13 @@ pub(crate) fn build(
                 if created_date == today {
                     today_tokens = today_tokens.saturating_add(tokens);
                     has_today_token_data = true;
+
+                    // A session created today cannot contain usage from an
+                    // earlier date, so its lifetime total is attributable to
+                    // today's heatmap tooltip when dated events are absent.
+                    let day = days.entry(created_date).or_default();
+                    day.tokens = day.tokens.saturating_add(tokens);
+                    day.has_token_data = true;
                 }
                 if created_date >= current_week_start {
                     week_tokens = week_tokens.saturating_add(tokens);
@@ -356,6 +365,9 @@ pub(crate) fn build(
             else {
                 continue;
             };
+            let day = days.entry(date).or_default();
+            day.tokens = day.tokens.saturating_add(event.tokens);
+            day.has_token_data = true;
             if date == today {
                 today_tokens = today_tokens.saturating_add(event.tokens);
                 has_today_token_data = true;
@@ -709,6 +721,7 @@ fn day_window(
                 day: date.format("%Y-%m-%d").to_string(),
                 sessions: counts.map_or(0, |counts| counts.sessions),
                 prompts: counts.map_or(0, |counts| counts.prompts),
+                tokens: counts.and_then(|counts| counts.has_token_data.then_some(counts.tokens)),
             }
         })
         .collect()
@@ -728,6 +741,7 @@ fn date_window(
                 day: date.format("%Y-%m-%d").to_string(),
                 sessions: counts.map_or(0, |counts| counts.sessions),
                 prompts: counts.map_or(0, |counts| counts.prompts),
+                tokens: counts.and_then(|counts| counts.has_token_data.then_some(counts.tokens)),
             }
         })
         .collect()

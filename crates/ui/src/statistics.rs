@@ -1109,10 +1109,16 @@ fn heat_cell(day: &UsageDay, max_prompts: u64, theme: &Theme) -> gpui::Stateful<
     } else {
         (0.2 + 0.68 * day.prompts as f32 / max_prompts as f32).clamp(0.2, 0.88)
     };
+    let token_label = day
+        .tokens
+        .map(format_heatmap_tokens)
+        .map(|tokens| format!("Token 消耗 {tokens}"))
+        .unwrap_or_else(|| "Token 消耗暂无日期明细".into());
     let date_label = format!(
-        "{} · {} 轮交互",
+        "{} · {} 轮交互 · {}",
         format_day_label(&day.day),
-        format_count(day.prompts)
+        format_count(day.prompts),
+        token_label
     );
     div()
         .id(SharedString::from(format!("stats-day-{}", day.day)))
@@ -1327,5 +1333,24 @@ fn format_tokens(value: u64) -> String {
         format!("{:.1}K", value as f64 / 1_000.0)
     } else {
         format_count(value)
+    }
+}
+
+fn format_heatmap_tokens(value: u64) -> String {
+    let (divisor, suffix) = if value >= 999_500_000 {
+        (1_000_000_000.0, "B")
+    } else if value >= 999_500 {
+        (1_000_000.0, "M")
+    } else if value >= 1_000 {
+        (1_000.0, "K")
+    } else {
+        return format_count(value);
+    };
+
+    let rounded = (value as f64 / divisor * 10.0).round() / 10.0;
+    if rounded.fract() == 0.0 {
+        format!("{rounded:.0}{suffix}")
+    } else {
+        format!("{rounded:.1}{suffix}")
     }
 }
