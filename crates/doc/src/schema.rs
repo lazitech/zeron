@@ -3,7 +3,8 @@
 //! Container layout (MUST stay shape-compatible with the TS edge/tail materializer):
 //! - `meta`:     LoroMap  { chatId: string, schemaVersion: number }         (host-only writer)
 //! - `messages`: LoroList of LoroMap {
-//!   id, role, parts: LoroList<part map>, createdAt, deviceId, status?, continuationOf? }
+//!   id, role, parts: LoroList<part map>, createdAt, deviceId, status?,
+//!   continuationOf?, durationMs? }
 //! - `commands`: LoroList of LoroMap {
 //!   id, kind, payload(json), issuedBy, issuedAt, basedOn?, expiresAt?, status, resolution? }
 //! - `queue`:    LoroMovableList of LoroMap {
@@ -53,6 +54,11 @@ pub struct SessionMessageEntry {
     pub status: Option<MessageStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_of: Option<String>,
+    /// Wall-clock length of this assistant turn, stamped when the segment
+    /// finishes. Absent on user rows, live streams, and docs written before
+    /// the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
 }
 
 /// The doc-resident flat part map (`DocMessagePart` in TS). Distinct from the app-layer
@@ -86,6 +92,12 @@ struct DocPartJson {
     resolved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    /// Fork seam (`kind: "fork"`, additive): the chat the history above was
+    /// copied from, and its title at the time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_chat_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_title: Option<String>,
     /// Tool output summary (additive — absent on old rows and old writers;
     /// pre-strip writers stored up to 4KB of capped output here).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -201,6 +213,17 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             message: Some(message.clone()),
             ..Default::default()
         },
+        MessagePart::Fork {
+            id,
+            source_chat_id,
+            source_title,
+        } => DocPartJson {
+            id: id.clone(),
+            kind: "fork".into(),
+            source_chat_id: Some(source_chat_id.clone()),
+            source_title: Some(source_title.clone()),
+            ..Default::default()
+        },
     })
 }
 
@@ -250,6 +273,11 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
         "reasoning" => MessagePart::Reasoning {
             id: p.id,
             text: p.reasoning.unwrap_or_default(),
+        },
+        "fork" => MessagePart::Fork {
+            id: p.id,
+            source_chat_id: p.source_chat_id.unwrap_or_default(),
+            source_title: p.source_title.unwrap_or_default(),
         },
         _ => MessagePart::Text {
             id: p.id,
@@ -381,6 +409,25 @@ impl SessionDoc {
             self.doc
                 .get_map("meta")
                 .insert("sessionUsage", serde_json::to_string(&usage)?)?;
+            self.doc.commit();
+        }
+        Ok(())
+    }
+
+    /// The provider session that received a fork's copied history — a side
+    /// chat's bootstrap is owed to any other session it continues in.
+    pub fn fork_history_session(&self) -> Option<String> {
+        match self.doc.get_map("meta").get("forkHistorySession") {
+            Some(loro::ValueOrContainer::Value(LoroValue::String(s))) => Some(s.to_string()),
+            _ => None,
+        }
+    }
+
+    pub fn set_fork_history_session(&self, session_id: &str) -> Result<(), DocError> {
+        if self.fork_history_session().as_deref() != Some(session_id) {
+            self.doc
+                .get_map("meta")
+                .insert("forkHistorySession", session_id)?;
             self.doc.commit();
         }
         Ok(())
@@ -809,6 +856,9 @@ fn write_entry_scalar_fields(map: &LoroMap, entry: &SessionMessageEntry) -> Resu
     if let Some(continuation_of) = &entry.continuation_of {
         map.insert("continuationOf", continuation_of.as_str())?;
     }
+    if let Some(duration_ms) = entry.duration_ms {
+        map.insert("durationMs", duration_ms)?;
+    }
     Ok(())
 }
 
@@ -860,6 +910,14 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     if let Some(message) = &doc_part.message {
         map.insert("message", message.as_str())?;
     }
+    for (key, value) in [
+        ("sourceChatId", &doc_part.source_chat_id),
+        ("sourceTitle", &doc_part.source_title),
+    ] {
+        if let Some(value) = value {
+            map.insert(key, value.as_str())?;
+        }
+    }
     if let Some(output) = &doc_part.output {
         map.insert("output", output.as_str())?;
     }
@@ -904,6 +962,8 @@ fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError
         status: Option<MessageStatus>,
         #[serde(default)]
         continuation_of: Option<String>,
+        #[serde(default)]
+        duration_ms: Option<i64>,
     }
     match serde_json::from_value::<RawEntry>(v.clone()) {
         Ok(raw) => Ok(SessionMessageEntry {
@@ -914,6 +974,7 @@ fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError
             device_id: raw.device_id,
             status: raw.status,
             continuation_of: raw.continuation_of,
+            duration_ms: raw.duration_ms,
         }),
         // 2026-08-10 incident rule: a missing field must cost AT MOST what
         // the field carried — never the entry, never the transcript. Rooms
@@ -978,6 +1039,7 @@ fn salvage_entry(
             .get("status")
             .and_then(|s| serde_json::from_value(s.clone()).ok()),
         continuation_of: str_field("continuationOf"),
+        duration_ms: obj.get("durationMs").and_then(|x| x.as_i64()),
     })
 }
 
@@ -1063,6 +1125,9 @@ pub fn join_continuation_entries(entries: Vec<SessionMessageEntry>) -> Vec<Sessi
             Some(root_id) => {
                 if let Some(&at) = root_index.get(root_id) {
                     out[at].parts.extend(entry.parts);
+                    if entry.duration_ms.is_some() {
+                        out[at].duration_ms = entry.duration_ms;
+                    }
                 } else {
                     // Orphan continuation — surface as its own entry rather than dropping.
                     out.push(entry);
@@ -1094,6 +1159,7 @@ pub struct SegmentWriter<'a> {
     entry_index: usize,
     /// Mirror of what we've written so far (part id → app part).
     written: Vec<MessagePart>,
+    created_at: i64,
 }
 
 impl<'a> SegmentWriter<'a> {
@@ -1117,6 +1183,7 @@ impl<'a> SegmentWriter<'a> {
                 device_id: device_id.into(),
                 status: Some(MessageStatus::Streaming),
                 continuation_of: None,
+                duration_ms: None,
             },
         )?;
         map.insert_container("parts", LoroList::new())?;
@@ -1125,6 +1192,7 @@ impl<'a> SegmentWriter<'a> {
             doc,
             entry_index,
             written: Vec::new(),
+            created_at,
         })
     }
 
@@ -1133,10 +1201,20 @@ impl<'a> SegmentWriter<'a> {
     /// the seam that lets a sink hold `(entry_index, written)` between
     /// coalesced flushes instead of a doc-borrowing writer.
     pub fn resume(doc: &'a SessionDoc, entry_index: usize, written: Vec<MessagePart>) -> Self {
+        let created_at = match doc.doc.get_list("messages").get(entry_index) {
+            Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) => {
+                match map.get("createdAt") {
+                    Some(loro::ValueOrContainer::Value(LoroValue::I64(ms))) => ms,
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        };
         Self {
             doc,
             entry_index,
             written,
+            created_at,
         }
     }
 
@@ -1230,11 +1308,19 @@ impl<'a> SegmentWriter<'a> {
         Ok(())
     }
 
-    /// Finish the stream: sync final parts and stamp a terminal status.
+    /// Finish the stream: sync final parts, stamp a terminal status, and
+    /// record how long the turn ran (`now - createdAt`).
     pub fn finish(mut self, folded: &[MessagePart], status: MessageStatus) -> Result<(), DocError> {
         self.sync(folded)?;
         let map = self.entry_map()?;
         map.insert("status", status_str(status))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(self.created_at);
+        if self.created_at > 0 {
+            map.insert("durationMs", (now - self.created_at).max(0))?;
+        }
         self.doc.doc.commit();
         Ok(())
     }
@@ -1361,6 +1447,31 @@ pub fn materialize_tail(
 mod tests {
     use super::*;
     use crate::parts::fold_event_into_parts;
+
+    #[test]
+    fn fork_seam_round_trips_through_the_doc() {
+        let doc = SessionDoc::init("fork").unwrap();
+        let seam = MessagePart::Fork {
+            id: "fork:side".into(),
+            source_chat_id: "main".into(),
+            source_title: "Main conversation".into(),
+        };
+        doc.push_message(&SessionMessageEntry {
+            duration_ms: None,
+            id: "fork:side".into(),
+            role: MessageRole::System,
+            parts: vec![seam.clone()],
+            created_at: 1,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, MessageRole::System);
+        assert_eq!(entries[0].parts, vec![seam]);
+    }
     use zeron_proto::{AgentEvent, ToolCall};
 
     #[test]
@@ -1380,6 +1491,7 @@ mod tests {
                 device_id: "device".into(),
                 status: Some(MessageStatus::Complete),
                 continuation_of: (segment > 0).then(|| "segment-0".into()),
+                duration_ms: None,
             })
             .unwrap();
         }
@@ -1456,6 +1568,7 @@ mod tests {
             device_id: "dev-a".into(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
+            duration_ms: None,
         }
     }
 
@@ -1624,6 +1737,7 @@ mod tests {
             // The orphan case: the run died and recovery stamped the entry.
             status: Some(MessageStatus::Aborted),
             continuation_of: None,
+            duration_ms: None,
         })
         .unwrap();
         assert!(!doc.resolve_input("nope").unwrap());
@@ -1714,6 +1828,10 @@ mod tests {
         let entries = doc.read_entries().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, Some(MessageStatus::Complete));
+        assert!(
+            entries[0].duration_ms.is_some(),
+            "finish stamps how long the turn ran"
+        );
         assert_eq!(entries[0].parts.len(), 2);
         match &entries[0].parts[0] {
             MessagePart::Text { text, .. } => assert_eq!(text, "Hello"),
@@ -1887,6 +2005,7 @@ mod tests {
             device_id: "dev-a".into(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
+            duration_ms: None,
         })
         .unwrap();
         let entries = doc.read_entries().unwrap();

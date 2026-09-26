@@ -12,6 +12,7 @@
 //! - [`shell`] — sidebar + main panel + right-pane scaffold + gate;
 //! - [`loaders`] — zeron pulse loader, gradient spinner, boot splash.
 
+mod account_usage;
 pub mod app_menus;
 pub mod appearance;
 pub mod appshots;
@@ -24,6 +25,7 @@ mod comment_ui;
 pub mod comments;
 pub mod composer;
 mod composer_dock;
+mod composer_markdown;
 mod context_usage;
 pub mod edge_fade;
 pub mod file_icons;
@@ -44,6 +46,7 @@ mod notice;
 pub mod notify;
 pub mod pickers;
 pub mod popover;
+pub mod project_actions;
 pub mod queue;
 pub mod rail;
 pub mod settings;
@@ -67,16 +70,6 @@ use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOp
 
 pub use state::EngineBootConfig;
 pub use zeron_proto::HarnessId;
-
-/// Whether a control whose primary action is click activation may also start
-/// a GPUI drag from the same hitbox. GPUI promotes pointer travel above 2 px
-/// to a drag. Normal Windows click jitter can cross that threshold, cancel the
-/// click, and leave the drag ghost following the pointer instead of activating
-/// the control. Drag-first controls (resize handles, scrollbars, queue rows)
-/// intentionally do not use this policy.
-pub(crate) const fn click_activation_drag_enabled() -> bool {
-    !cfg!(target_os = "windows")
-}
 
 /// Everything the headed binary passes in (config/env resolution lives in
 /// `apps/zeron`, not here).

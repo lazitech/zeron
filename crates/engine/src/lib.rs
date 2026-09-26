@@ -25,8 +25,11 @@ pub mod doc_host;
 mod http_error;
 pub mod instance_lock;
 pub mod local_import;
+mod model_catalogs;
+mod native_token_usage;
 mod native_usage_index;
 pub mod profile;
+pub mod project_actions;
 pub mod registry;
 pub mod repos;
 pub mod rpc;
@@ -37,7 +40,6 @@ pub mod spaces;
 pub mod terminals;
 pub mod titles;
 mod transcript_history;
-mod native_token_usage;
 pub mod uploads;
 mod usage_stats;
 pub mod workspace_files;
@@ -48,12 +50,13 @@ pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
-    capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff, merge_base,
-    read_diff_file_text, snapshot_tree, working_diff_base,
+    capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff,
+    discard_working_tree, merge_base, read_diff_file_text, snapshot_tree, working_diff_base,
 };
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
 pub use profile::EngineProfile;
+pub use project_actions::ProjectActionsStore;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
@@ -132,6 +135,7 @@ pub struct EngineCore {
     pub repos: Repos,
     pub workspace_files: WorkspaceFiles,
     pub terminals: Terminals,
+    pub project_actions: ProjectActionsStore,
     pub previews: zeron_preview::PreviewService,
     pub change_requests: CheckoutChangeRequests,
     pub diff_sync: CheckoutDiffSync,
@@ -227,7 +231,7 @@ impl EngineCore {
                 None
             }
         };
-        // This device's harness enablement (Settings → Agents) rides the
+        // This device's harness enablement (Settings → Providers) rides the
         // engine data dir — per-device, like the CLI installs it gates.
         registry.load_prefs(data_dir);
         let store = Arc::new(DocsStore::open(profile.store_root())?);
@@ -268,6 +272,8 @@ impl EngineCore {
         let workspace_files =
             WorkspaceFiles::new(repos.clone(), workspace.clone(), device_id.clone());
         let terminals = Terminals::new();
+        let project_actions = ProjectActionsStore::open(profile.store_root())?;
+        doc_host.set_project_action_runtime(project_actions.clone(), terminals.clone());
         let previews = zeron_preview::PreviewService::new(
             profile.store_root().join("previews.json"),
             device_id.clone(),
@@ -307,7 +313,10 @@ impl EngineCore {
                 uploads.clone(),
             )
         });
-        let agent_accounts = AgentAccounts::new(agent_accounts_config);
+        // Logins started from another device publish their callback port to
+        // the P2P service, which serves it to that device alone.
+        let agent_accounts =
+            AgentAccounts::with_callback_routes(agent_accounts_config, previews.callback_routes());
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -328,6 +337,7 @@ impl EngineCore {
             repos,
             workspace_files,
             terminals,
+            project_actions,
             previews,
             change_requests,
             diff_sync,
@@ -440,12 +450,11 @@ impl EngineCore {
             zeron_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
         let doc_host = self.doc_host.clone();
         let on_nudge: zeron_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
-            // Opening the doc joins its room + syncs; drain fires on the change
-            // subscription — the command executes with no standing per-chat socket.
-            match doc_host.open(&chat_id) {
-                Ok(_) => tracing::info!(chat = %chat_id, "nudge: chat doc opened"),
+            match doc_host.enqueue_wakeup(&chat_id) {
+                Ok(()) => true,
                 Err(err) => {
-                    tracing::warn!(chat = %chat_id, error = %err, "nudge: open failed")
+                    tracing::warn!(chat = %chat_id, %err, "nudge: durable admission failed; withholding ACK");
+                    false
                 }
             }
         });
@@ -461,6 +470,7 @@ impl EngineCore {
             self.repos.clone(),
             self.workspace_files.clone(),
             self.terminals.clone(),
+            self.project_actions.clone(),
             self.change_requests.clone(),
             self.diff_sync.clone(),
             self.uploads.clone(),
@@ -814,36 +824,28 @@ impl Engine {
             tokens: Arc::new(auth.clone()),
         });
         core.previews.start(projects, preview_signaling).await;
-        // Portable Windows packages explicitly configure an update feed; users
-        // should not need to enable workspace sync to receive application updates.
-        let check_updates = edge_enabled;
-        #[cfg(windows)]
-        let check_updates = check_updates
-            || matches!(
-                zeron_update::detect_install(),
-                zeron_update::InstallKind::WindowsPortable { .. }
-            );
-        if check_updates {
-            // Release checker: polls {edge}/releases on a 6h cadence; headless
-            // installs with ZERON_AUTO_UPDATE=1 apply + restart themselves — gated
-            // on quiescence so a restart never lands under a live run or open PTY.
-            let quiescent: zeron_update::QuiescentCheck = {
-                let sessions = core.sessions.clone();
-                let terminals = core.terminals.clone();
-                Arc::new(move || !sessions.any_active() && !terminals.any_open())
-            };
-            let updater = zeron_update::Updater::spawn(config.edge_url.clone(), Some(quiescent));
-            if let Some(mut token_changes) = edge.as_ref().and_then(EdgeConfig::token_changes) {
-                let updater_for_tokens = updater.clone();
-                let wake = tokio::spawn(async move {
-                    while token_changes.changed().await.is_ok() {
-                        updater_for_tokens.check_now();
-                    }
-                });
-                core.set_updater_wake(wake);
-            }
-            core.set_updater(updater);
+        // Release checker: polls {edge}/releases on a 6h cadence; headless
+        // installs with ZERON_AUTO_UPDATE=1 apply + restart themselves — gated
+        // on quiescence so a restart never lands under a live run or open PTY.
+        // Spawned for every install: application updates must not depend on
+        // workspace sync being enabled — the feed is the public release feed
+        // (served without authentication), not an edge feature.
+        let quiescent: zeron_update::QuiescentCheck = {
+            let sessions = core.sessions.clone();
+            let terminals = core.terminals.clone();
+            Arc::new(move || !sessions.any_active() && !terminals.any_open())
+        };
+        let updater = zeron_update::Updater::spawn(config.edge_url.clone(), Some(quiescent));
+        if let Some(mut token_changes) = edge.as_ref().and_then(EdgeConfig::token_changes) {
+            let updater_for_tokens = updater.clone();
+            let wake = tokio::spawn(async move {
+                while token_changes.changed().await.is_ok() {
+                    updater_for_tokens.check_now();
+                }
+            });
+            core.set_updater_wake(wake);
         }
+        core.set_updater(updater);
         tracing::info!(device_id = %core.device_id, "engine core assembled");
         // Managed ACP adapters install in the background at boot (agents
         // whose CLI is present but whose adapter isn't yet), so a first chat
@@ -911,6 +913,9 @@ impl Engine {
             stop_tx,
         });
         let server = serve_ipc(config.ipc_port, service).await?;
+        // Only a port this process actually serves goes to agents: the
+        // injected MCP server must dial back into THIS engine.
+        runtime.core().sessions.set_ipc_port(config.ipc_port);
 
         tokio::select! {
             result = shutdown_signal() => result?,
@@ -1203,6 +1208,46 @@ fn native_friendly_device_name() -> Option<String> {
     None
 }
 
+#[cfg(all(test, windows))]
+mod identity_lock_retry_tests {
+    use super::*;
+
+    /// A concurrent holder of the lock file (share_mode(0)) fails the open
+    /// with ERROR_SHARING_VIOLATION, which Rust reports as
+    /// ErrorKind::Uncategorized, not PermissionDenied. acquire must retry
+    /// through that error until the holder releases; before the fix the
+    /// retry loop never matched it and startup failed outright.
+    #[test]
+    fn acquire_retries_through_sharing_violations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device-id.lock");
+
+        // Hold the file exclusively for 50ms, then release. The retry loop
+        // has a 200 x 5ms budget, so the timing is comfortable.
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let holder = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(0)
+                .open(&path)
+                .unwrap();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                drop(holder);
+            });
+        }
+
+        let lock = DeviceIdentityLock::acquire(dir.path());
+        assert!(
+            lock.is_ok(),
+            "acquire did not retry through the sharing violation"
+        );
+    }
+}
+
 #[cfg(test)]
 mod device_name_tests {
     use super::select_local_device_name;
@@ -1380,8 +1425,17 @@ impl DeviceIdentityLock {
             let file = loop {
                 match options.open(&path) {
                     Ok(file) => break file,
+                    // share_mode(0) means a concurrent holder fails the open
+                    // with ERROR_SHARING_VIOLATION (raw os error 32), which
+                    // Rust maps to ErrorKind::Uncategorized, not
+                    // PermissionDenied. Retry through both.
                     Err(err)
-                        if err.kind() == std::io::ErrorKind::PermissionDenied && retries > 0 =>
+                        if (err.raw_os_error()
+                            == Some(
+                                windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32,
+                            )
+                            || err.kind() == std::io::ErrorKind::PermissionDenied)
+                            && retries > 0 =>
                     {
                         retries -= 1;
                         std::thread::sleep(std::time::Duration::from_millis(5));

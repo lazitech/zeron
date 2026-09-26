@@ -45,9 +45,9 @@
 - Known limitation: if parsing a native file's dated token events fails, the
   error is logged, but current coverage metadata may not mark date-specific
   token statistics as incomplete. Treat those totals as potentially partial.
-- The feature branch is based on an older upstream revision. Do not rebase or
-  merge upstream automatically; preserve the personal changes and inspect the
-  resulting diff if the user later requests an update.
+- Official v0.2.94 was merged on 2026-09-26 while preserving personal changes.
+  Do not rebase or merge later upstream updates automatically; preserve the
+  personal changes and inspect the resulting diff when an update is requested.
 
 ## Verification
 

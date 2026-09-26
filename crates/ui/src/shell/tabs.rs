@@ -39,6 +39,38 @@ pub(super) fn right_pane_expand_icon(expanded: bool) -> &'static str {
     }
 }
 
+struct PanelTitlebarWidths {
+    surface_reveal: f32,
+    files_controls: f32,
+}
+
+/// The session header's "+" and fork buttons (28px each, 2px gap) plus the
+/// row gap they cost the project-actions control.
+const SESSION_CONTROLS_WIDTH: f32 = 28.0 * 2.0 + 2.0 + 8.0;
+
+/// The two fixed right-edge anchors: the explorer toggle and the pane toggle
+/// (28px each) with the same 4px gap the surface strip keeps between its
+/// controls, so the two never render as one fused block.
+const PANEL_TOGGLE_GAP: f32 = 4.0;
+const PANEL_TOGGLE_SLOTS: f32 = 28.0 * 2.0 + PANEL_TOGGLE_GAP;
+
+fn panel_titlebar_widths(
+    surfaces_visible: f32,
+    files_visible: f32,
+    available: f32,
+    right_pad: f32,
+) -> PanelTitlebarWidths {
+    // Caption controls occupy the far-right panel first. Subtract their
+    // clearance once across the combined header, then split it at Files.
+    // The explorer and pane toggles keep their slots even when closed.
+    let files_controls = (files_visible - right_pad).max(PANEL_TOGGLE_SLOTS);
+    let surfaces = surfaces_visible + files_visible - right_pad - files_controls;
+    PanelTitlebarWidths {
+        surface_reveal: surfaces.min(available - files_controls).max(0.0),
+        files_controls,
+    }
+}
+
 impl Shell {
     /// Navigation requests focus once the destination composer renders.
     pub(super) fn focus_composer(&mut self, cx: &mut Context<Self>) {
@@ -52,14 +84,13 @@ impl Shell {
     /// the order it is drawn. Selection is immediate (no MRU overlay held open
     /// on the modifier) — one press, one session.
     ///
-    /// Chat-scoped chrome, like the panel toggles: gpui dispatches a matched
-    /// binding before any `on_key_down`, so an unscoped cycle would fire
-    /// underneath Settings (yanking the user off the page mid-record, since
-    /// these are the very keys the shortcuts table invites them to press) or
-    /// underneath the add-space palette, stranding the overlay over a session
-    /// they never picked.
+    /// Works from Settings too, landing back in chat like a jump; the
+    /// shortcut recorder intercepts these keys while it records. Quiet under
+    /// a keyboard-owning overlay: gpui dispatches a matched binding before any
+    /// `on_key_down`, so a cycle under the add-space palette would strand the
+    /// overlay over a session the user never picked.
     pub(super) fn cycle_session(&mut self, forward: bool, cx: &mut Context<Self>) {
-        if !matches!(self.route, Route::Chat) || self.overlay_owns_keyboard(cx) {
+        if self.overlay_owns_keyboard(cx) {
             return;
         }
         // The same list `render_active_rows` draws and the jump shortcuts
@@ -105,10 +136,28 @@ impl Shell {
     /// `+` in the titlebar: open the new-session canvas. A set sidebar filter
     /// re-homes the canvas onto that project; under "All" the current pick
     /// (the last selected project, restored from composer defaults) stands.
+    ///
+    /// A new chat always starts with the terminal hidden: when the drawer is
+    /// open it just hides (detach, not close — the source chat's tabs and
+    /// PTYs survive for the return trip).
     pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
         self.command_palette = None;
         self.route = Route::Chat;
         self.focus_composer(cx);
+        // Pre-hide before the selection flips so the state change can't
+        // auto-create a canvas tab (the panel's observer runs on the same
+        // update). The source chat's flag stays set — returning restores it.
+        let was_open = self.terminal_open(cx)
+            || self
+                .terminal
+                .as_ref()
+                .is_some_and(|panel| panel.read(cx).is_open());
+        if was_open {
+            self.terminal_tween = None;
+            if let Some(panel) = self.terminal.clone() {
+                panel.update(cx, |panel, cx| panel.set_open(false, cx));
+            }
+        }
         let target = {
             let state = self.state.read(cx);
             self.settings
@@ -130,6 +179,20 @@ impl Shell {
             }
             s.select_chat(None, cx);
         });
+        // The canvas never restores a drawer: a previously opened canvas
+        // terminal must not pop open on a fresh new chat.
+        let key = self.panel_key(cx);
+        if self.panels.get(&key).terminal_open {
+            self.panels.update(&key, |panels| {
+                panels.terminal_open = false;
+            });
+        }
+        self.terminal_tween = None;
+        if let Some(panel) = self.terminal.clone()
+            && panel.read(cx).is_open()
+        {
+            panel.update(cx, |panel, cx| panel.set_open(false, cx));
+        }
         cx.notify();
     }
 
@@ -137,7 +200,11 @@ impl Shell {
     /// `[new-session +] [harness icon + session title] … [toggle-changes]`.
     /// Replaces the tab strip; inherits its titlebar duties (drag region,
     /// animated left inset, the toggle-changes button on git projects).
-    pub(super) fn render_session_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_session_title_bar(
+        &mut self,
+        viewport_height: Pixels,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         // The canvas titles as NOTHING (user request — a "New session"
         // header over the empty canvas was noise); the bar keeps its height,
@@ -195,7 +262,8 @@ impl Shell {
         // the pane itself would sit under the drag region and never see a
         // click. Closed, it is just the stable open/close toggle. Hidden on
         // the new-session canvas (user request) — nothing to diff yet.
-        let takeover = !on_canvas && self.right_pane_open(cx) && self.right_pane_expanded;
+        let right_pane_open = !on_canvas && self.right_pane_open(cx);
+        let takeover = right_pane_open && self.right_pane_expanded;
         // In takeover the title hides and the strip owns the whole band, so
         // the row's left inset pulls back to the sidebar seam — the title
         // inset would push the scope dropdown off the pane's own left gutter
@@ -221,29 +289,49 @@ impl Shell {
         } else {
             content_left
         };
+        let row_gap = 8.0;
+        let files_width = self.files_visible_width(cx);
+        let right_pad = self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET);
+        // The title row's gaps are outside the fixed-width panel controls.
+        let gap_budget = if takeover { row_gap } else { row_gap * 3.0 };
+        let right_visible = self.right_visible_width(cx);
+        let widths = panel_titlebar_widths(
+            right_visible,
+            files_width,
+            self.viewport_width - row_left - right_pad - gap_budget,
+            right_pad,
+        );
+        // The trailing strip always carries the explorer slot with its two
+        // toggles; the surface tabs reveal to their left only while the surface
+        // host is open.
+        let trailing_width = if on_canvas {
+            0.0
+        } else {
+            let surface = if right_pane_open {
+                widths.surface_reveal
+            } else {
+                0.0
+            };
+            surface + widths.files_controls
+        };
+        let available_titlebar_width =
+            (self.viewport_width - row_left - right_pad - trailing_width - row_gap * 3.0).max(0.0);
+
         let trailing: Option<gpui::AnyElement> = if on_canvas {
             None
         } else {
-            let right_open = self.right_pane_open(cx);
             let mut controls = div()
                 .id("right-titlebar-controls")
                 .flex_none()
                 .h_full()
                 .flex()
                 .flex_row()
-                .items_center();
-            if right_open {
-                let right_now = self.eval_tween(self.right_tween, self.right_target(cx));
-                let pr = self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET);
-                // The row's own left padding is part of its content box: a strip
-                // wider than what's left after it overflows and clips at the right
-                // edge (flex_none never shrinks) — cap to the available width. The
-                // row's 8px child gaps sit OUTSIDE the strip's width (one before
-                // the strip in takeover, two with the title row present): without
-                // budgeting them the capped strip overflows by exactly one gap and
-                // the buttons slide right on expand (user report).
-                let gap_budget = if takeover { 8.0 } else { 16.0 };
-                let avail = self.viewport_width - row_left - pr - gap_budget;
+                .items_center()
+                // The transcript extends under this band (it fades beneath
+                // the tab strip); a wheel over the tabs must scroll the
+                // strip, never the surface behind it.
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
+            if right_pane_open {
                 // The right pane's SURFACE TABS (t3 RightPanelTabs) — the diff
                 // options that used to live here moved into the pane's own
                 // second row; expand stays in this band (user request).
@@ -252,10 +340,9 @@ impl Shell {
                 // sidebar control. Only the tabs + expand section reveals to
                 // its left; including the toggle in this animated width
                 // compressed both icons into the same clipped box at open.
-                let animated_width = ((right_now - pr).min(avail) - 28.0).max(0.0);
                 controls = controls.child(
                     div()
-                        .w(px(animated_width))
+                        .w(px(widths.surface_reveal))
                         .h_full()
                         .flex_none()
                         .flex()
@@ -284,28 +371,111 @@ impl Shell {
                         )),
                 );
             }
-            // Keep the trigger mounted at one fixed position while the pane
-            // controls reveal to its left.
+            // The explorer slot sits over the explorer column and carries the
+            // two fixed right-edge anchors — the explorer toggle and,
+            // outermost, the pane toggle — which stay mounted at one position
+            // while the surface tabs reveal to their left. The explorer's own
+            // search and visibility controls live in its secondary header.
             Some(
                 controls
-                    .child(header_icon_button(
-                        "toggle-changes",
-                        icons::SIDEBAR_MINIMALISTIC,
-                        &theme,
-                        cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
-                    ))
+                    .child(
+                        div()
+                            .w(px(widths.files_controls))
+                            .h_full()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap(px(PANEL_TOGGLE_GAP))
+                            // No hairline here: the explorer column below is
+                            // padded down by the titlebar height and its left
+                            // border already runs through this band, so a
+                            // second one on the slot stacked on the same
+                            // pixels and read lighter than the seam beneath
+                            // it (user report).
+                            .child(
+                                header_icon_button(
+                                    "toggle-files-panel",
+                                    icons::FILE_TREE,
+                                    &theme,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.toggle_files_panel(window, cx)
+                                    }),
+                                )
+                                .role(gpui::Role::Button)
+                                .aria_label(if self.files_panel_open(cx) {
+                                    "Hide files panel"
+                                } else {
+                                    "Show files panel"
+                                })
+                                .when(self.files_panel_open(cx), |button| {
+                                    button.bg(crate::theme::wash(0.09))
+                                }),
+                            )
+                            .child(header_icon_button(
+                                "toggle-changes",
+                                icons::SIDEBAR_MINIMALISTIC,
+                                &theme,
+                                cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
+                            )),
+                    )
                     .into_any_element(),
             )
         };
 
+        // The session's own side-chat controls: "+" mints a fresh side chat
+        // under this session, fork copies its history into one. Same pair
+        // the side-chat header carries, so a family reads the same from
+        // either end.
+        let session_controls = (!takeover && !on_canvas).then(|| {
+            let busy = self.side_chat_creating;
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(2.0))
+                .child(
+                    header_icon_button(
+                        "session-new-side-chat",
+                        icons::PLUS,
+                        &theme,
+                        cx.listener(|this, _, _, cx| this.create_child_chat(None, cx)),
+                    )
+                    .role(gpui::Role::Button)
+                    .aria_label("New side chat")
+                    .when(busy, |el| el.opacity(0.4)),
+                )
+                .child(
+                    header_icon_button(
+                        "session-fork",
+                        icons::GIT_BRANCH,
+                        &theme,
+                        cx.listener(|this, _, _, cx| this.create_side_chat(cx)),
+                    )
+                    .role(gpui::Role::Button)
+                    .aria_label("Fork this session")
+                    .when(busy, |el| el.opacity(0.4)),
+                )
+        });
+        let available_titlebar_width = if session_controls.is_some() {
+            (available_titlebar_width - SESSION_CONTROLS_WIDTH).max(0.0)
+        } else {
+            available_titlebar_width
+        };
+        let actions = (!takeover && !on_canvas)
+            .then(|| {
+                self.render_project_actions_control(available_titlebar_width, viewport_height, cx)
+            })
+            .flatten();
         let inner = div()
             .size_full()
             .flex()
             .items_center()
             .pt(px(Theme::TITLEBAR_TOP_PAD))
-            .gap(px(8.0))
+            .gap(px(row_gap))
             .pl(px(row_left))
-            .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)))
+            .pr(px(right_pad))
             // In panel takeover the header strip spans the whole band — the
             // title would sit UNDER it (both flex_none, the row overflows and
             // paint order stacks them), so it hides for the duration.
@@ -313,6 +483,7 @@ impl Shell {
                 el.child(
                     div()
                         .min_w_0()
+                        .overflow_hidden()
                         .flex()
                         .flex_row()
                         .items_center()
@@ -344,7 +515,8 @@ impl Shell {
                         .when_some(target, |el, target| {
                             el.child(
                                 div()
-                                    .flex_none()
+                                    .min_w_0()
+                                    .truncate()
                                     .text_size(crate::typography::ui_rems(12.0))
                                     .text_color(theme.text_muted.opacity(0.5))
                                     .child(target),
@@ -353,6 +525,8 @@ impl Shell {
                 )
             })
             .child(div().flex_1())
+            .children(session_controls)
+            .children(actions)
             .children(trailing);
 
         // The unified window titlebar: full-width on the glass shell, ABOVE
@@ -361,6 +535,71 @@ impl Shell {
         let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
         self.titlebar_drag_region("chat-titlebar", bar, cx)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod panel_titlebar_tests {
+    use super::*;
+
+    #[test]
+    fn tabs_align_with_the_panel_for_each_caption_layout_and_files_width() {
+        let viewport = 1400.0;
+        for right_pad in [6.0, 40.0, 92.0, 114.0] {
+            for files in [0.0, 10.0, 28.0, 100.0, 220.0, 286.0, 440.0] {
+                let widths = panel_titlebar_widths(520.0, files, 1100.0, right_pad);
+                let controls_left =
+                    viewport - right_pad - widths.files_controls - widths.surface_reveal;
+                assert_eq!(
+                    controls_left,
+                    viewport - files - 520.0,
+                    "caption clearance {right_pad}, Files width {files}"
+                );
+                assert!(widths.files_controls >= PANEL_TOGGLE_SLOTS);
+                if files >= right_pad + PANEL_TOGGLE_SLOTS {
+                    assert_eq!(
+                        viewport - right_pad - widths.files_controls,
+                        viewport - files
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_tabs_clear_the_left_controls_without_reserving_captions_twice() {
+        for right_pad in [6.0, 92.0, 114.0] {
+            let viewport = 1400.0;
+            let files = 286.0;
+            // With the sidebar open, the header starts exactly at its seam.
+            // With it collapsed, leave room for the window/nav controls.
+            for (sidebar, row_left) in [(256.0, 248.0), (0.0, 180.0)] {
+                let widths = panel_titlebar_widths(
+                    viewport - sidebar - files,
+                    files,
+                    viewport - row_left - right_pad - 8.0,
+                    right_pad,
+                );
+                let controls_left =
+                    viewport - right_pad - widths.files_controls - widths.surface_reveal;
+                assert_eq!(controls_left, sidebar.max(row_left + 8.0));
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_panels_and_tight_headers_keep_nonnegative_reveal_widths() {
+        // A narrow surface and Files share a 520px header.
+        let widths = panel_titlebar_widths(234.0, 286.0, 600.0, 92.0);
+        assert_eq!(
+            1000.0 - 92.0 - widths.files_controls - widths.surface_reveal,
+            480.0
+        );
+        for available in [-20.0, 0.0, 28.0, 56.0, 100.0] {
+            let widths = panel_titlebar_widths(0.0, 0.0, available, 114.0);
+            assert_eq!(widths.surface_reveal, 0.0);
+            assert_eq!(widths.files_controls, PANEL_TOGGLE_SLOTS);
+        }
     }
 }
 

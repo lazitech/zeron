@@ -1,16 +1,14 @@
 //! Context occupancy is read from the replicated chat snapshot, never local CLI state.
 use crate::theme::Theme;
 use gpui::{
-    Context, IntoElement, PathBuilder, Render, SharedString, Window, canvas, div, point,
+    Context, Entity, IntoElement, PathBuilder, Render, SharedString, Window, canvas, div, point,
     prelude::*, px,
 };
 use zeron_proto::{ContextUsage, SessionUsage};
 
-pub fn render(
-    usage: Option<ContextUsage>,
-    state: gpui::Entity<crate::state::AppState>,
-    theme: &Theme,
-) -> gpui::Stateful<gpui::Div> {
+/// The context ring's trigger chip; the footer ([`crate::account_usage`])
+/// opens [`card`] from it on click.
+pub fn chip(usage: Option<ContextUsage>, open: bool, theme: &Theme) -> gpui::Stateful<gpui::Div> {
     let fraction = usage.and_then(ContextUsage::fraction);
     let color = match fraction {
         Some(f) if f >= 0.9 => theme.danger,
@@ -18,8 +16,55 @@ pub fn render(
         Some(_) => theme.text_muted,
         None => theme.text_faint,
     };
+    let label = fraction
+        .map(|f| format!("{:.0}%", f * 100.0))
+        .unwrap_or_else(|| "—".into());
+    ring_chip(
+        "context-usage",
+        fraction.unwrap_or(0.0) as f32,
+        color,
+        color,
+        label,
+        open,
+        theme,
+    )
+}
+
+/// One footer ring indicator: ring + percent, identical geometry for every
+/// ring so they sit side by side as equals. `arc` colours the ring's fill,
+/// `text` the label; `open` holds the hover wash while its popover is up.
+pub(crate) fn ring_chip(
+    id: &'static str,
+    fraction: f32,
+    arc: gpui::Hsla,
+    text: gpui::Hsla,
+    label: String,
+    open: bool,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(5.0))
+        .h(px(24.0))
+        .px(px(6.0))
+        .rounded(px(6.0))
+        .text_size(px(11.0))
+        .text_color(text)
+        .cursor_pointer()
+        .when(open, |s| s.bg(crate::theme::ink(0.05)))
+        .hover(|s| s.bg(crate::theme::ink(0.05)))
+        .child(ring(fraction, arc, theme))
+        .child(SharedString::from(label))
+}
+
+/// The footer's 16px progress ring: a faint full track under a `fraction` arc
+/// starting at twelve o'clock. Shared with the account usage indicator.
+pub(crate) fn ring(fraction: f32, color: gpui::Hsla, theme: &Theme) -> impl IntoElement {
     let track = theme.text_faint.opacity(0.25);
-    let ring = canvas(
+    canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
             let center = bounds.center();
@@ -47,39 +92,10 @@ pub fn render(
                 }
             };
             arc(1.0, track);
-            arc(fraction.unwrap_or(0.0).clamp(0.0, 1.0) as f32, color);
+            arc(fraction.clamp(0.0, 1.0), color);
         },
     )
-    .size(px(16.0));
-    let label = fraction
-        .map(|f| format!("{:.0}%", f * 100.0))
-        .unwrap_or_else(|| "—".into());
-    div()
-        .id("context-usage")
-        .flex_none()
-        .flex()
-        .items_center()
-        .gap(px(5.0))
-        .h(px(24.0))
-        .px(px(6.0))
-        .rounded(px(6.0))
-        .text_size(px(11.0))
-        .text_color(color)
-        .hover(|s| s.bg(crate::theme::ink(0.05)))
-        .child(ring)
-        .child(SharedString::from(label))
-        .tooltip(move |_, cx| {
-            cx.new(|cx| UsageCard {
-                _subscription: cx.observe(&state, |_, _, cx| cx.notify()),
-                state: state.clone(),
-            })
-            .into()
-        })
-}
-
-struct UsageCard {
-    state: gpui::Entity<crate::state::AppState>,
-    _subscription: gpui::Subscription,
+    .size(px(16.0))
 }
 
 fn with_separators(count: u64) -> String {
@@ -92,6 +108,43 @@ fn with_separators(count: u64) -> String {
         grouped.push(digit);
     }
     grouped
+}
+
+/// The legacy context indicator remains available to callers that only need
+/// the local session-usage tooltip. The account-usage footer wraps its own
+/// ring cluster with [`with_session_tooltip`] so the upstream account quota
+/// ring and this session detail card share one hover surface.
+pub fn render(
+    usage: Option<ContextUsage>,
+    state: Entity<crate::state::AppState>,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    let fraction = usage.and_then(ContextUsage::fraction).unwrap_or(0.0) as f32;
+    let color = match usage.and_then(ContextUsage::fraction) {
+        Some(f) if f >= 0.9 => theme.danger,
+        Some(f) if f >= 0.75 => theme.warning,
+        Some(_) => theme.text_muted,
+        None => theme.text_faint,
+    };
+    let label = usage
+        .and_then(ContextUsage::fraction)
+        .map(|f| format!("{:.0}%", f * 100.0))
+        .unwrap_or_else(|| "—".into());
+    let indicator = div()
+        .id("context-usage")
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(5.0))
+        .h(px(24.0))
+        .px(px(6.0))
+        .rounded(px(6.0))
+        .text_size(px(11.0))
+        .text_color(color)
+        .hover(|s| s.bg(crate::theme::ink(0.05)))
+        .child(ring(fraction, color, theme))
+        .child(SharedString::from(label));
+    with_session_tooltip(indicator, state)
 }
 
 /// Whether the context ring has a reported window to measure against.
@@ -109,6 +162,37 @@ pub fn has_any_usage(
     session_usage: Option<SessionUsage>,
 ) -> bool {
     has_window(context_usage) || session_usage.is_some()
+}
+
+fn details(usage: Option<ContextUsage>) -> String {
+    match usage.unwrap_or_default() {
+        ContextUsage {
+            tokens: Some(tokens),
+            window: Some(window),
+        } if window > 0 => {
+            format!(
+                "{} / {} tokens\n{} tokens remaining",
+                with_separators(tokens),
+                with_separators(window),
+                with_separators(window.saturating_sub(tokens))
+            )
+        }
+        ContextUsage {
+            tokens: Some(tokens),
+            ..
+        } => format!(
+            "{} tokens used\nContext limit not reported",
+            with_separators(tokens)
+        ),
+        ContextUsage {
+            window: Some(window),
+            ..
+        } if window > 0 => format!(
+            "{} token capacity\nWaiting for context usage",
+            with_separators(window)
+        ),
+        _ => "Context usage not reported by this harness yet".into(),
+    }
 }
 
 fn token_value(value: Option<u64>) -> String {
@@ -141,6 +225,28 @@ fn metric_row(label: &'static str, value: String, theme: &Theme) -> gpui::Div {
         )
 }
 
+/// The local session token usage card shown when hovering the footer rings.
+pub struct UsageCard {
+    state: Entity<crate::state::AppState>,
+    _subscription: gpui::Subscription,
+}
+
+/// Add the session token tooltip to a footer element without changing its
+/// visual children. This lets the upstream account quota and context rings
+/// remain a single cluster while retaining the local token details.
+pub fn with_session_tooltip(
+    element: gpui::Stateful<gpui::Div>,
+    state: Entity<crate::state::AppState>,
+) -> gpui::Stateful<gpui::Div> {
+    element.tooltip(move |_, cx| {
+        cx.new(|cx| UsageCard {
+            _subscription: cx.observe(&state, |_, _, cx| cx.notify()),
+            state: state.clone(),
+        })
+        .into()
+    })
+}
+
 impl Render for UsageCard {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &Theme::of(cx).for_popup();
@@ -168,6 +274,24 @@ impl Render for UsageCard {
             ]);
         crate::frost::frosted(crate::popover::CARD_RADIUS, crate::frost::MENU_BLUR, card)
     }
+}
+
+/// The context ring's popover content.
+pub fn card(usage: Option<ContextUsage>, theme: &Theme) -> gpui::Div {
+    crate::popover::popover_card(theme)
+        .flex()
+        .flex_col()
+        .child(crate::popover::menu_heading(theme, "Context window"))
+        .child(
+            div()
+                .px(px(8.0))
+                .pb(px(6.0))
+                .text_size(px(12.0))
+                .line_height(px(19.0))
+                .whitespace_nowrap()
+                .text_color(theme.text_muted)
+                .child(SharedString::from(details(usage))),
+        )
 }
 
 #[cfg(test)]

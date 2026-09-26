@@ -126,6 +126,29 @@ pub struct RunRequest {
     /// host ignores it and runs in `cwd` (the repo's main checkout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeSpec>,
+    /// Zeron's own MCP server, injected by the HOST engine as it starts the
+    /// run: the `zeron mcp` subcommand of this same binary, pointed at the
+    /// engine's loopback IPC and stamped with the originating chat so the
+    /// agent can spawn, read, and message side chats. Additive +
+    /// serde-defaulted — an old host leaves it unset and the agent simply has
+    /// no Zeron tools; title runs never carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpServer>,
+}
+
+/// A stdio MCP server the harness should add to the agent's session, on top
+/// of whatever the user configured. Each driver spells it in its own dialect
+/// (Claude `--mcp-config`, ACP `session/new` `mcpServers`, Codex
+/// `mcp_servers.*` config overrides).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServer {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// Isolated-worktree directive riding [`RunRequest`]. The worktree is created
@@ -140,6 +163,10 @@ pub struct WorktreeSpec {
     pub repo_path: String,
     /// Base ref the fresh `zeron/<name>` branch is created off.
     pub base: String,
+    /// Owning project used to resolve host-local setup Actions. Optional for
+    /// wire compatibility with clients that only request worktree creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
 }
 
 /// The session-scoped singleton id for the live plan/todo chip. ACP plan
@@ -571,11 +598,13 @@ mod tests {
             worktree: Some(WorktreeSpec {
                 repo_path: "/repos/comet".into(),
                 base: "main".into(),
+                space_id: Some("space-1".into()),
             }),
             ..req
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["worktree"]["repoPath"], "/repos/comet");
+        assert_eq!(json["worktree"]["spaceId"], "space-1");
         let round: RunRequest = serde_json::from_value(json).unwrap();
         assert_eq!(round.worktree, req.worktree);
     }
