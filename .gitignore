@@ -10,3 +10,5 @@ node_modules
 .wrangler
 build/
 edge/dist/
+# Ignore newly added files under docs; existing tracked documentation remains tracked.
+/docs/
