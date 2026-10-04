@@ -665,6 +665,14 @@ pub fn canvas_panel_key(space_id: Option<&str>) -> String {
     format!("{CANVAS_PANEL_PREFIX}{}", space_id.unwrap_or(""))
 }
 
+/// The new-session canvas's project/device pick, see [`AppState::canvas_target`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanvasTarget {
+    space: Option<String>,
+    no_project: bool,
+    device: Option<String>,
+}
+
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
@@ -716,6 +724,10 @@ pub struct AppState {
     /// device whose projects the project picker lists. `None` falls back to
     /// the local device.
     pub selected_device: Option<String>,
+    /// The new-session canvas's own target, set aside while a chat is open
+    /// (a chat implies ITS project/device) and put back on return, so the
+    /// canvas always reopens where the user left it.
+    pub(crate) canvas_target: Option<CanvasTarget>,
     pub selected_chat: Option<String>,
     /// Boot auto-select happened (or a manual selection superseded it).
     pub auto_selected: bool,
@@ -745,6 +757,9 @@ pub struct AppState {
     /// Changes only when transcript/optimistic content changes. Presence,
     /// catalogs and other app-state notifications need no row derivation.
     pub(crate) transcript_revision: u64,
+    /// Changes whenever an input of [`Self::file_link_roots`] does — chat
+    /// rows, projects, this device's id — so views can memoize the roots.
+    pub(crate) link_roots_revision: u64,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
@@ -766,14 +781,15 @@ pub struct AppState {
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
-    /// Latest `UpdateStatus` frame — drives the sidebar update strip.
-    pub update: Option<zeron_update::UpdateStatus>,
     /// Latest process-local statistics snapshot, preloaded after engine attach.
     pub(crate) usage_statistics: Option<Arc<UsageStatistics>>,
     usage_statistics_updated_at: Option<Instant>,
     pub(crate) usage_statistics_loading: bool,
     pub(crate) usage_statistics_error: Option<String>,
     usage_statistics_task: Option<Task<()>>,
+    /// Device-local agent CLI update lifecycle. Unlike `ListHarnesses`, this
+    /// standing stream may be backed by subprocess and network probes.
+    pub harness_updates: Vec<zeron_proto::HarnessUpdateStatus>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
@@ -836,6 +852,7 @@ impl AppState {
             selected_space: None,
             no_project: false,
             selected_device: None,
+            canvas_target: None,
             selected_chat: None,
             transcript: Vec::new(),
             queue: Vec::new(),
@@ -846,6 +863,7 @@ impl AppState {
             transcript_cache: Default::default(),
             prepared_transcripts: HashMap::new(),
             transcript_revision: 0,
+            link_roots_revision: 0,
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
             upload_progress: None,
@@ -853,12 +871,12 @@ impl AppState {
             review_comments: HashMap::new(),
             review_comment_flushes: HashMap::new(),
             local_device_id: None,
-            update: None,
             usage_statistics: None,
             usage_statistics_updated_at: None,
             usage_statistics_loading: false,
             usage_statistics_error: None,
             usage_statistics_task: None,
+            harness_updates: Vec::new(),
             data_dir: None,
             engine: None,
             watch_tasks: Vec::new(),
@@ -1057,6 +1075,7 @@ impl AppState {
         }
         sort_chats(&mut chats);
         self.chats = chats;
+        self.link_roots_revision = self.link_roots_revision.wrapping_add(1);
         self.chats_synced = true;
         self.transcript_cache
             .retain(|cached| self.chats.iter().any(|c| c.id == cached.chat_id));
@@ -1067,6 +1086,7 @@ impl AppState {
             self.transcript_baselines.remove(selected);
             self.prepared_transcripts.remove(selected);
             self.selected_chat = None;
+            self.restore_canvas_target();
             self.transcript.clear();
             self.context_usage = None;
             self.session_usage = None;
@@ -1108,6 +1128,7 @@ impl AppState {
     pub fn apply_spaces(&mut self, mut spaces: Vec<Space>) {
         sort_spaces(&mut spaces);
         self.spaces = spaces;
+        self.link_roots_revision = self.link_roots_revision.wrapping_add(1);
         self.spaces_synced = true;
         if self.no_project {
             self.selected_space = None;
@@ -1130,6 +1151,83 @@ impl AppState {
         if self.selected_space.is_none() && !self.no_project {
             self.selected_space = self.first_space_on_picked_device();
         }
+    }
+
+    /// The ordered checkouts a file link from `chat_id` may resolve against:
+    /// the chat's own checkout, its parent chat's, then every project root on
+    /// the linking chat's device — an agent's paths name its own disk, so a
+    /// root on another device never owns them. Project roots have no owning
+    /// chat — a link that matches one opens by absolute path through the
+    /// linking chat. `local` marks roots whose files sit on this disk; a
+    /// remote chat's worktree still resolves links (reads go through its own
+    /// device) but cannot offer local file actions.
+    pub(crate) fn file_link_roots(
+        &self,
+        chat_id: &str,
+    ) -> Vec<crate::workspace_links::FileLinkRoot> {
+        use crate::workspace_links::FileLinkRoot;
+        // An unprobed device id means the chats on screen are the local
+        // engine's — everything shown counts as local until sync says else.
+        let on_this_device = |device: &str| {
+            self.local_device_id
+                .as_deref()
+                .is_none_or(|local| device == local)
+        };
+        let mut roots: Vec<FileLinkRoot> = Vec::new();
+        let mut push = |chat: Option<&Chat>, device: &str, root: Option<&str>| {
+            let Some(root) = root.filter(|root| !root.is_empty()) else {
+                return;
+            };
+            if roots.iter().any(|existing| existing.root == root) {
+                return;
+            }
+            roots.push(FileLinkRoot {
+                chat: chat.map(|chat| chat.id.clone()),
+                local: on_this_device(device),
+                root: root.to_owned(),
+            });
+        };
+        let chat_row = |id: &str| self.chats.iter().find(|chat| chat.id == id);
+        let linking = chat_row(chat_id);
+        // Roots on the linking chat's device; an unknown chat row falls back
+        // to this device's.
+        let on_link_device = |device: &str| match linking {
+            Some(chat) => chat.device_id == device,
+            None => on_this_device(device),
+        };
+        if let Some(chat) = linking {
+            push(Some(chat), &chat.device_id, chat.cwd.as_deref());
+        }
+        if let Some(parent) = linking
+            .and_then(|chat| chat.parent_chat_id.as_deref())
+            .and_then(chat_row)
+            .filter(|parent| on_link_device(&parent.device_id))
+        {
+            push(Some(parent), &parent.device_id, parent.cwd.as_deref());
+        }
+        for space in self
+            .spaces
+            .iter()
+            .filter(|space| on_link_device(&space.device_id))
+        {
+            push(None, &space.device_id, Some(space.path.as_str()));
+        }
+        roots
+    }
+
+    /// Whether `chat_id` lives on this device — an outside file link from it
+    /// resolves to this disk, so its menu may offer local file actions. An
+    /// unprobed device id (or an unknown chat row) counts as local, matching
+    /// `file_link_roots`.
+    pub(crate) fn chat_is_local(&self, chat_id: &str) -> bool {
+        self.chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .is_none_or(|chat| {
+                self.local_device_id
+                    .as_deref()
+                    .is_none_or(|local| chat.device_id == local)
+            })
     }
 
     /// Optimistic local echo of a `setChatConfig` mutate: stamp the row now so
@@ -1175,8 +1273,7 @@ impl AppState {
         if Some(chat.device_id.as_str()) == self.local_device_id.as_deref() {
             return false;
         }
-        if self.connectivity.state == S::Offline
-            || !self.device_online(&chat.device_id, Utc::now())
+        if self.connectivity.state == S::Offline || !self.device_online(&chat.device_id, Utc::now())
         {
             return true;
         }
@@ -1299,8 +1396,8 @@ impl AppState {
             .map(|s| s.id.clone())
     }
 
-    pub fn apply_update(&mut self, status: zeron_update::UpdateStatus) {
-        self.update = Some(status);
+    pub fn apply_harness_updates(&mut self, statuses: Vec<zeron_proto::HarnessUpdateStatus>) {
+        self.harness_updates = statuses;
     }
 
     pub fn apply_auth(&mut self, auth: AuthState) {
@@ -1730,6 +1827,34 @@ impl AppState {
         }
     }
 
+    fn current_canvas_target(&self) -> CanvasTarget {
+        CanvasTarget {
+            space: self.selected_space.clone(),
+            no_project: self.no_project,
+            device: self.selected_device.clone(),
+        }
+    }
+
+    /// Put back the canvas target set aside when a chat opened. A project
+    /// deleted meanwhile heals the way [`Self::apply_spaces`] would.
+    fn restore_canvas_target(&mut self) {
+        let Some(target) = self.canvas_target.take() else {
+            return;
+        };
+        self.selected_device = target.device;
+        self.no_project = target.no_project;
+        self.selected_space = target.space;
+        if self.spaces_synced
+            && !self.no_project
+            && self
+                .selected_space
+                .as_ref()
+                .is_none_or(|id| !self.spaces.iter().any(|s| &s.id == id))
+        {
+            self.selected_space = self.first_space_on_picked_device();
+        }
+    }
+
     pub fn selected_space_row(&self) -> Option<&Space> {
         if self.no_project {
             return None;
@@ -2001,6 +2126,7 @@ impl AppState {
         self.selected_space = None;
         self.no_project = false;
         self.selected_device = None;
+        self.canvas_target = None;
         self.selected_chat = None;
         self.auto_selected = false;
         self.chats_synced = false;
@@ -2018,12 +2144,12 @@ impl AppState {
         self.upload_progress = None;
         self.transfers.clear();
         self.local_device_id = None;
-        self.update = None;
         self.usage_statistics = None;
         self.usage_statistics_updated_at = None;
         self.usage_statistics_loading = false;
         self.usage_statistics_error = None;
         self.usage_statistics_task = None;
+        self.link_roots_revision = self.link_roots_revision.wrapping_add(1);
         cx.notify();
     }
 
@@ -2060,6 +2186,16 @@ impl AppState {
     /// This is a side chat's state whose chat its first send has yet to mint.
     pub(crate) fn side_chat_unsaved(&self) -> bool {
         self.unsaved_side_chat
+    }
+
+    /// The harness can change until the first send snapshots it.
+    /// Keep the harness fixed while createChat is in flight, including uploads.
+    pub(crate) fn side_chat_harness_editable(&self) -> bool {
+        self.unsaved_side_chat
+            && self
+                .selected_chat
+                .as_ref()
+                .is_some_and(|id| !self.pending_sends.contains_key(id))
     }
 
     fn is_unsaved_side_chat(&self, chat_id: &str) -> bool {
@@ -2158,8 +2294,14 @@ impl AppState {
         // baseline instead of comparing the new runtime with the old one.
         self.connectivity_observed = false;
         let engine_info = handle.engine_info();
+        let supports_harness_updates =
+            engine_info.supports(zeron_proto::capabilities::HARNESS_UPDATES_V1);
         self.workspace_scope = Some(engine_info.workspace_scope);
         self.local_device_id = Some(engine_info.device_id.clone());
+        self.link_roots_revision = self.link_roots_revision.wrapping_add(1);
+        if !supports_harness_updates {
+            self.harness_updates.clear();
+        }
         self.engine = Some(handle.clone());
         let mut watch_tasks = Vec::with_capacity(11);
         if let Some(task) = spawn_deferred_engine_watch(cx, handle.clone()) {
@@ -2212,17 +2354,19 @@ impl AppState {
                 state.apply_auth_value(value);
                 true
             }),
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::UPDATE_STATUS,
-                |state, value| {
-                    state.apply_update(value);
-                    true
-                },
-            ),
             spawn_local_device_probe(cx, handle.clone()),
         ]);
+        if supports_harness_updates {
+            watch_tasks.push(spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_HARNESS_UPDATES,
+                |state, value| {
+                    state.apply_harness_updates(value);
+                    true
+                },
+            ));
+        }
         self.watch_tasks = watch_tasks;
         self.request_usage_statistics(cx);
         self.reconcile_change_request_watches(cx);
@@ -2340,6 +2484,11 @@ impl AppState {
             }
             return;
         }
+        match (&self.selected_chat, &chat_id) {
+            (None, Some(_)) => self.canvas_target = Some(self.current_canvas_target()),
+            (Some(_), None) => self.restore_canvas_target(),
+            _ => {}
+        }
         // Take the destination before trimming: switching to the oldest warm
         // transcript must not evict the very entry we are about to display.
         let cached = self
@@ -2433,7 +2582,7 @@ impl AppState {
         self.queue_task = None;
         if let Some(id) = chat_id.as_deref() {
             // A chat implies its project (or the lack of one); `select_chat(None)`
-            // (the new-session canvas) keeps the current project pick.
+            // (the new-session canvas) restores the pick set aside above.
             if let Some(chat) = self.chats.iter().find(|c| c.id == id) {
                 match chat.space_id.clone() {
                     Some(space_id) => {
@@ -2553,7 +2702,10 @@ impl AppState {
         cx.spawn(async move |_, _| {
             if let Err(error) = handle
                 .client()
-                .call(methods::FOCUS_CHAT, serde_json::json!({ "chatId": chat_id }))
+                .call(
+                    methods::FOCUS_CHAT,
+                    serde_json::json!({ "chatId": chat_id }),
+                )
                 .await
             {
                 tracing::debug!(%chat_id, %error, "chat focus sync hint unavailable");
@@ -2821,6 +2973,7 @@ fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) ->
         if let Some(id) = id {
             this.update(cx, |state, cx| {
                 state.local_device_id = Some(id);
+                state.link_roots_revision = state.link_roots_revision.wrapping_add(1);
                 state.apply_pending_deep_link(cx);
                 // Watches opened before this probe conservatively route through
                 // targetDeviceId. Recreate them now that local routing is known.
@@ -4300,6 +4453,75 @@ mod tests {
     }
 
     #[test]
+    fn file_link_roots_order_chat_parent_then_projects() {
+        use crate::workspace_links::FileLinkRoot;
+        let mut state = AppState::new();
+        state.local_device_id = Some("dev".into());
+        let mut parent = chat("parent", 0, None);
+        parent.cwd = Some("/repo".into());
+        let mut fork = chat("fork", 1, None);
+        fork.cwd = Some("/fork/fork".into());
+        fork.parent_chat_id = Some("parent".into());
+        // A chat hosted on another device still contributes its checkout —
+        // reads go through it — but is flagged remote so system-level file
+        // actions stay hidden.
+        let mut remote = chat("remote", 2, None);
+        remote.device_id = "other".into();
+        remote.cwd = Some("/far/worktree".into());
+        remote.parent_chat_id = Some("fork".into());
+        state.apply_chats(vec![parent, fork, remote]);
+        state.apply_spaces(vec![
+            space("local", "dev", "/projects/zeron", 0),
+            space("remote", "other", "/remote/only", 1),
+        ]);
+        let root = |chat: Option<&str>, root: &str, local: bool| FileLinkRoot {
+            chat: chat.map(str::to_owned),
+            root: root.into(),
+            local,
+        };
+
+        let roots = state.file_link_roots("fork");
+        assert_eq!(
+            roots,
+            vec![
+                root(Some("fork"), "/fork/fork", true),
+                root(Some("parent"), "/repo", true),
+                root(None, "/projects/zeron", true),
+            ],
+            "own checkout, parent, then this device's projects"
+        );
+        assert!(state.chat_is_local("fork"));
+        assert!(!state.chat_is_local("remote"));
+        // A remote chat's paths name its own device: this device's projects
+        // and a parent hosted here never own them.
+        assert_eq!(
+            state.file_link_roots("remote"),
+            vec![
+                root(Some("remote"), "/far/worktree", false),
+                root(None, "/remote/only", false),
+            ]
+        );
+
+        // An absolute path outside every known root is still a file: it
+        // resolves as an outside link owned by the linking chat.
+        let root_refs: Vec<&str> = roots.iter().map(|root| root.root.as_str()).collect();
+        assert!(matches!(
+            crate::workspace_links::first_root_owning("/elsewhere/x.md", root_refs.clone()),
+            Some(crate::workspace_links::FileLinkResolution::Outside(link))
+                if link.path == "/elsewhere/x.md" && link.outside
+        ));
+        // A path under the parent's checkout resolves to that root.
+        assert_eq!(
+            match crate::workspace_links::first_root_owning("/repo/src/lib.rs", root_refs) {
+                Some(crate::workspace_links::FileLinkResolution::Owned { root, link }) =>
+                    Some((roots[root].chat.clone(), link.path)),
+                _ => None,
+            },
+            Some((Some("parent".into()), "src/lib.rs".into()))
+        );
+    }
+
+    #[test]
     fn canvas_terminal_uses_the_selected_project_folder() {
         let mut state = AppState::new();
         state.local_device_id = Some("local".into());
@@ -4417,6 +4639,46 @@ mod tests {
             state.select_device("empty-device".into(), cx);
             assert!(state.selected_space.is_none());
             assert_eq!(state.effective_device_id().as_deref(), Some("empty-device"));
+        });
+    }
+
+    #[gpui::test]
+    fn canvas_reopens_on_its_own_target_after_visiting_chats(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.apply_spaces(vec![
+                space("s1", "dev", "/a", 1),
+                space("s2", "remote", "/b", 2),
+            ]);
+            let mut remote = chat("remote-chat", 1, None);
+            remote.device_id = "remote".into();
+            remote.space_id = Some("s2".into());
+            let mut loose = chat("loose-chat", 2, None);
+            loose.device_id = "remote".into();
+            state.apply_chats(vec![remote, loose.clone()]);
+            state.select_space(Some("s1".into()), cx);
+
+            // Chats imply their own target while open…
+            state.select_chat(Some("remote-chat".into()), cx);
+            assert_eq!(state.selected_space.as_deref(), Some("s2"));
+            state.select_chat(Some("loose-chat".into()), cx);
+            assert!(state.no_project);
+            // …and the canvas returns to where it was left.
+            state.select_chat(None, cx);
+            assert!(!state.no_project);
+            assert_eq!(state.selected_space.as_deref(), Some("s1"));
+            assert_eq!(state.effective_device_id().as_deref(), Some("dev"));
+
+            // A projectless canvas survives a project chat, and a chat deleted
+            // elsewhere lands back on it too.
+            state.select_space(None, cx);
+            state.select_device("remote".into(), cx);
+            state.select_chat(Some("remote-chat".into()), cx);
+            state.apply_chats(vec![loose]);
+            assert!(state.selected_chat.is_none());
+            assert!(state.no_project);
+            assert!(state.selected_space.is_none());
+            assert_eq!(state.effective_device_id().as_deref(), Some("remote"));
         });
     }
 

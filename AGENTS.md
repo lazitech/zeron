@@ -45,12 +45,18 @@
 - Known limitation: if parsing a native file's dated token events fails, the
   error is logged, but current coverage metadata may not mark date-specific
   token statistics as incomplete. Treat those totals as potentially partial.
-- Official v0.2.94 was merged on 2026-09-26 while preserving personal changes.
+- Official `main` through `9e1a1115` (v0.2.102 plus subsequent updates) was
+  merged on 2026-10-03 while preserving personal changes. The pre-merge state
+  is saved as `backup/personal-before-upstream-20261003-f6bd1ac5`.
   Do not rebase or merge later upstream updates automatically; preserve the
   personal changes and inspect the resulting diff when an update is requested.
 
 ## Verification
 
 - Automated builds and tests should be run when the user asks to verify them.
+- Ubuntu's OpenSSL development files are extracted under
+  `$CONDA_PREFIX/share/ubuntu-openssl`; environment-scoped `OPENSSL_*`
+  variables select these headers and the system OpenSSL runtime libraries.
+  See the administrator-free setup in `docs/development/conda.md`.
 - For a requested visual check, activate `zeron-dev` and run `cargo run -p zeron`
   from the repository root.

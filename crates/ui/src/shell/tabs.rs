@@ -72,6 +72,85 @@ fn panel_titlebar_widths(
 }
 
 impl Shell {
+    /// The same binding navigates the focused pane. Keep the persisted action
+    /// IDs so existing user keymaps and the native browser bridge still work.
+    pub(super) fn cycle_navigation(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.navigation_overlay_open(cx) {
+            return;
+        }
+        if matches!(self.route, Route::Chat)
+            && self.right_pane_open(cx)
+            && self.navigation_focus.in_right(window, cx)
+        {
+            let rows = self.right_surface_rows(cx);
+            if rows.len() <= 1 {
+                return;
+            }
+            let active = self.resolved_right_active(cx);
+            let at = rows.iter().position(|(surface, ..)| *surface == active);
+            let next = match (at, forward) {
+                (Some(at), true) => (at + 1) % rows.len(),
+                (Some(at), false) => (at + rows.len() - 1) % rows.len(),
+                (None, true) => 0,
+                (None, false) => rows.len() - 1,
+            };
+            self.activate_right_surface(rows[next].0, window, cx);
+        } else {
+            self.cycle_session(forward, cx);
+        }
+    }
+
+    fn navigation_overlay_open(&self, cx: &App) -> bool {
+        self.overlay_owns_keyboard(cx)
+            || self.sync_flow.has_visible_overlay()
+            || self.delete_confirm.is_some()
+            || self.delete_space_confirm.is_some()
+            || self.chat_rename.is_some()
+            || self.rename_space_dialog.is_some()
+            || self.discard_working_tree.is_some()
+            || self.chat_menu.get().is_some()
+            || self.space_menu.get().is_some()
+            || self.user_menu.get().is_some()
+            || self.spaces_menu.get().is_some()
+            || self.right_plus.get().is_some()
+            || !self.pending_file_closes.is_empty()
+            || self.pending_exit.is_some()
+    }
+
+    pub(super) fn activate_right_surface(
+        &mut self,
+        surface: RightSurface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigation_focus.right_was_focused = true;
+        self.composer
+            .update(cx, |composer, _| composer.focus_pending = false);
+        // Establish a stable target before detaching the old editor. Read-only
+        // surfaces keep it; editable surfaces claim their own focus below/on mount.
+        window.focus(&self.navigation_focus.right, cx);
+        self.set_right_active(surface, cx);
+        self.focus_right_file_editor(surface, window, cx);
+    }
+
+    pub(super) fn restore_right_focus_after_close(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.right_pane_open(cx) {
+            self.activate_right_surface(self.resolved_right_active(cx), window, cx);
+        } else {
+            self.navigation_focus.right_was_focused = false;
+            window.focus(&self.composer.focus_handle(cx), cx);
+        }
+    }
+
     /// Navigation requests focus once the destination composer renders.
     pub(super) fn focus_composer(&mut self, cx: &mut Context<Self>) {
         self.composer.update(cx, |composer, cx| {
@@ -134,13 +213,16 @@ impl Shell {
     }
 
     /// `+` in the titlebar: open the new-session canvas. A set sidebar filter
-    /// re-homes the canvas onto that project; under "All" the current pick
-    /// (the last selected project, restored from composer defaults) stands.
+    /// re-homes the canvas onto that project; under "All" the canvas reopens
+    /// on the project/device it was left at (see `AppState::canvas_target`).
     ///
     /// A new chat always starts with the terminal hidden: when the drawer is
     /// open it just hides (detach, not close — the source chat's tabs and
     /// PTYs survive for the return trip).
-    pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// `project` (the per-project `+` on a sidebar group header) homes the
+    /// canvas on that project and wins over the sidebar filter.
+    pub(super) fn open_new_session(&mut self, project: Option<String>, cx: &mut Context<Self>) {
         self.command_palette = None;
         self.route = Route::Chat;
         self.focus_composer(cx);
@@ -160,24 +242,26 @@ impl Shell {
         }
         let target = {
             let state = self.state.read(cx);
-            self.settings
-                .space_filter
-                .clone()
+            project
+                .or_else(|| self.settings.space_filter.clone())
                 .filter(|id| state.space_row(id).is_some())
         };
         let defaults = crate::settings::composer::ComposerDefaults::load(&self.data_dir);
         self.state.update(cx, |s, cx| {
+            // Leaving a chat puts the canvas's own target back; the filter
+            // (an explicit standing choice) then applies on top of it.
+            let restores = s.canvas_target.is_some();
+            s.select_chat(None, cx);
             if target.is_some() {
                 s.select_space(target, cx);
-            } else if defaults.no_project {
-                // Opening an existing project session (including boot's last
-                // session) must not erase the saved new-session opt-out.
+            } else if !restores && defaults.no_project {
+                // No canvas target was set aside (e.g. after a runtime swap):
+                // fall back to the saved new-session opt-out.
                 s.select_space(None, cx);
                 if let Some(device) = defaults.device {
                     s.select_device(device, cx);
                 }
             }
-            s.select_chat(None, cx);
         });
         // The canvas never restores a drawer: a previously opened canvas
         // terminal must not pop open on a fresh new chat.
@@ -366,11 +450,21 @@ impl Shell {
                         .child(header_icon_button(
                             "expand-changes",
                             right_pane_expand_icon(self.right_pane_expanded),
+                            if self.right_pane_expanded {
+                                "Collapse panel"
+                            } else {
+                                "Expand panel"
+                            },
                             &theme,
                             cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
                         )),
                 );
             }
+            let files_panel_label = if self.files_panel_open(cx) {
+                "Hide files panel"
+            } else {
+                "Show files panel"
+            };
             // The explorer slot sits over the explorer column and carries the
             // two fixed right-edge anchors — the explorer toggle and,
             // outermost, the pane toggle — which stay mounted at one position
@@ -397,17 +491,14 @@ impl Shell {
                                 header_icon_button(
                                     "toggle-files-panel",
                                     icons::FILE_TREE,
+                                    files_panel_label,
                                     &theme,
                                     cx.listener(|this, _, window, cx| {
                                         this.toggle_files_panel(window, cx)
                                     }),
                                 )
                                 .role(gpui::Role::Button)
-                                .aria_label(if self.files_panel_open(cx) {
-                                    "Hide files panel"
-                                } else {
-                                    "Show files panel"
-                                })
+                                .aria_label(files_panel_label)
                                 .when(self.files_panel_open(cx), |button| {
                                     button.bg(crate::theme::wash(0.09))
                                 }),
@@ -415,6 +506,7 @@ impl Shell {
                             .child(header_icon_button(
                                 "toggle-changes",
                                 icons::SIDEBAR_MINIMALISTIC,
+                                ShortcutId::ToggleChanges.label(),
                                 &theme,
                                 cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
                             )),
@@ -439,6 +531,7 @@ impl Shell {
                     header_icon_button(
                         "session-new-side-chat",
                         icons::PLUS,
+                        "New side chat",
                         &theme,
                         cx.listener(|this, _, _, cx| this.create_child_chat(None, cx)),
                     )
@@ -450,6 +543,7 @@ impl Shell {
                     header_icon_button(
                         "session-fork",
                         icons::GIT_BRANCH,
+                        "Fork this session",
                         &theme,
                         cx.listener(|this, _, _, cx| this.create_side_chat(cx)),
                     )

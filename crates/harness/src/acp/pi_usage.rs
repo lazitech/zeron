@@ -22,20 +22,21 @@ use crate::HarnessError;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-type Event = Result<AgentEvent, HarnessError>;
+pub(crate) type Event = Result<AgentEvent, HarnessError>;
 
 /// A small controller for the background native-session reader.
-pub(super) struct Observer {
+pub(crate) struct Observer {
     refresh_tx: mpsc::Sender<RefreshRequest>,
     worker: Option<JoinHandle<()>>,
 }
 
 struct RefreshRequest {
     done: oneshot::Sender<()>,
+    force_context: bool,
 }
 
 impl Observer {
-    pub(super) fn start(
+    pub(crate) fn start(
         session_id: String,
         session_map: Option<PathBuf>,
         context_directory: Option<PathBuf>,
@@ -44,7 +45,32 @@ impl Observer {
         let (refresh_tx, refresh_rx) = mpsc::channel(8);
         let worker = tokio::spawn(run_worker(
             session_id,
-            session_map.unwrap_or_else(default_session_map_path),
+            Some(session_map.unwrap_or_else(default_session_map_path)),
+            None,
+            context_directory,
+            event_tx,
+            refresh_rx,
+        ));
+        Self {
+            refresh_tx,
+            worker: Some(worker),
+        }
+    }
+
+    /// Start an observer for the exact native JSONL path returned by Pi's
+    /// `get_state`. Native Pi no longer publishes the pi-acp session map, so
+    /// the caller supplies the path that [`sessions::Store`] recorded.
+    pub(crate) fn start_with_session_file(
+        session_id: String,
+        session_file: PathBuf,
+        context_directory: Option<PathBuf>,
+        event_tx: mpsc::Sender<Event>,
+    ) -> Self {
+        let (refresh_tx, refresh_rx) = mpsc::channel(8);
+        let worker = tokio::spawn(run_worker(
+            session_id,
+            None,
+            Some(session_file),
             context_directory,
             event_tx,
             refresh_rx,
@@ -60,12 +86,27 @@ impl Observer {
     /// The worker owns all filesystem work.  A closed command channel, a
     /// dropped worker, or a closed event receiver simply makes this a no-op;
     /// shutdown must never wait on a dead observer.
-    pub(super) async fn refresh(&self) {
+    pub(crate) async fn refresh(&self) {
+        self.refresh_with_context(false).await;
+    }
+
+    /// Refresh before the terminal event and re-emit the exact context
+    /// snapshot even when its value has not changed.  Pi's RPC normalizer may
+    /// have emitted an estimated `ContextUsage` after the last bridge write;
+    /// this keeps the exact native snapshot the final occupancy update.
+    pub(crate) async fn refresh_final(&self) {
+        self.refresh_with_context(true).await;
+    }
+
+    async fn refresh_with_context(&self, force_context: bool) {
         let _ = time::timeout(Duration::from_secs(2), async {
             let (done_tx, done_rx) = oneshot::channel();
             if self
                 .refresh_tx
-                .send(RefreshRequest { done: done_tx })
+                .send(RefreshRequest {
+                    done: done_tx,
+                    force_context,
+                })
                 .await
                 .is_ok()
             {
@@ -86,12 +127,19 @@ impl Drop for Observer {
 
 async fn run_worker(
     session_id: String,
-    session_map: PathBuf,
+    session_map: Option<PathBuf>,
+    session_file: Option<PathBuf>,
     context_directory: Option<PathBuf>,
     event_tx: mpsc::Sender<Event>,
     mut refresh_rx: mpsc::Receiver<RefreshRequest>,
 ) {
-    let mut reader = Reader::new(session_id, session_map);
+    let mut reader = match session_file {
+        Some(path) => Reader::new_with_session_file(session_id, path),
+        None => Reader::new(
+            session_id,
+            session_map.expect("Pi usage observer requires a map or session file"),
+        ),
+    };
     reader.context_directory = context_directory;
     let mut ticker = time::interval(POLL_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -99,13 +147,13 @@ async fn run_worker(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                if !reader.refresh(&event_tx).await {
+                if !reader.refresh(&event_tx, false).await {
                     break;
                 }
             }
             request = refresh_rx.recv() => {
                 let Some(request) = request else { break };
-                let alive = reader.refresh(&event_tx).await;
+                let alive = reader.refresh(&event_tx, request.force_context).await;
                 let _ = request.done.send(());
                 if !alive {
                     break;
@@ -125,6 +173,7 @@ fn default_session_map_path() -> PathBuf {
 struct Reader {
     session_id: String,
     session_map: PathBuf,
+    session_file: Option<PathBuf>,
     state: ReaderState,
     context_directory: Option<PathBuf>,
     last_context: Option<ContextUsage>,
@@ -135,23 +184,40 @@ impl Reader {
         Self {
             session_id,
             session_map,
+            session_file: None,
             state: ReaderState::default(),
             context_directory: None,
             last_context: None,
         }
     }
 
-    async fn refresh(&mut self, event_tx: &mpsc::Sender<Event>) -> bool {
+    fn new_with_session_file(session_id: String, session_file: PathBuf) -> Self {
+        Self {
+            session_id,
+            session_map: PathBuf::new(),
+            session_file: Some(session_file),
+            state: ReaderState::default(),
+            context_directory: None,
+            last_context: None,
+        }
+    }
+
+    async fn refresh(&mut self, event_tx: &mpsc::Sender<Event>, force_context: bool) -> bool {
         let state = std::mem::take(&mut self.state);
         let session_id = self.session_id.clone();
         let session_map = self.session_map.clone();
+        let session_file = self.session_file.clone();
 
         let directory = self.context_directory.clone();
         let result = tokio::task::spawn_blocking(move || {
             let context = directory
                 .as_deref()
                 .and_then(|directory| super::pi_context::read_snapshot(directory, &session_id));
-            let (state, snapshot) = state.refresh_blocking(&session_id, &session_map);
+            let (state, snapshot) = state.refresh_blocking(
+                &session_id,
+                (!session_map.as_os_str().is_empty()).then_some(session_map.as_path()),
+                session_file.as_deref(),
+            );
             (state, snapshot, context)
         })
         .await;
@@ -165,7 +231,7 @@ impl Reader {
         };
         self.state = state;
         if let Some(usage) = context
-            && self.last_context != Some(usage)
+            && (force_context || self.last_context != Some(usage))
         {
             self.last_context = Some(usage);
             if event_tx
@@ -208,31 +274,43 @@ impl ReaderState {
     fn refresh_blocking(
         mut self,
         session_id: &str,
-        session_map: &Path,
+        session_map: Option<&Path>,
+        explicit_session_file: Option<&Path>,
     ) -> (Self, Option<SessionUsage>) {
-        let Ok(map_metadata) = fs::metadata(session_map) else {
-            return (self, None);
-        };
-        let map_stamp = FileStamp::from_metadata(&map_metadata);
-        if self.map_stamp.as_ref() != Some(&map_stamp) || self.mapped_file.is_none() {
-            self.mapped_file = resolve_session_file(session_id, session_map);
-            self.map_stamp = Some(map_stamp);
-        }
-        let Some(session_file) = self.mapped_file.clone() else {
-            return (self, None);
+        let session_file = if let Some(path) = explicit_session_file {
+            path.to_owned()
+        } else {
+            let Some(session_map) = session_map else {
+                return (self, None);
+            };
+            let Ok(map_metadata) = fs::metadata(session_map) else {
+                return (self, None);
+            };
+            let map_stamp = FileStamp::from_metadata(&map_metadata);
+            if self.map_stamp.as_ref() != Some(&map_stamp) || self.mapped_file.is_none() {
+                self.mapped_file = resolve_session_file(session_id, session_map);
+                self.map_stamp = Some(map_stamp);
+            }
+            let Some(session_file) = self.mapped_file.clone() else {
+                return (self, None);
+            };
+
+            // The native adapter stores an absolute path.  Relative paths are
+            // accepted only as a convenience for hand-written/test maps and are
+            // resolved relative to the map file's directory.
+            if session_file.is_absolute() {
+                session_file
+            } else {
+                session_map
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(session_file)
+            }
         };
 
-        // The native adapter stores an absolute path.  Relative paths are
-        // accepted only as a convenience for hand-written/test maps and are
-        // resolved relative to the map file's directory.
-        let session_file = if session_file.is_absolute() {
-            session_file
-        } else {
-            session_map
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(session_file)
-        };
+        // An explicit native path comes from Pi's get_state and is required to
+        // be absolute by sessions::Store.  Keep relative paths usable for the
+        // legacy map/test path above, but do not reinterpret a native path.
 
         // Resolve metadata again after relative-path normalization.
         let Ok(metadata) = fs::metadata(&session_file) else {
@@ -740,7 +818,10 @@ mod tests {
     fn run_reader(mut reader: Reader) -> (Reader, Option<SessionUsage>) {
         let session_id = reader.session_id.clone();
         let session_map = reader.session_map.clone();
-        let (state, snapshot) = reader.state.refresh_blocking(&session_id, &session_map);
+        let (state, snapshot) =
+            reader
+                .state
+                .refresh_blocking(&session_id, Some(&session_map), None);
         reader.state = state;
         (reader, snapshot)
     }

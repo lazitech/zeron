@@ -8,15 +8,25 @@ use zeron_proto::ContextUsage;
 
 const SOURCE: &str = include_str!("pi_context.mjs");
 const MARKER: &str = "// Zeron-owned Pi context bridge.";
-pub(super) const DIRECTORY_ENV: &str = "ZERON_PI_CONTEXT_DIR";
+pub(crate) const DIRECTORY_ENV: &str = "ZERON_PI_CONTEXT_DIR";
 
-pub(super) struct Bridge {
-    pub(super) directory: PathBuf,
+pub(crate) struct Bridge {
+    pub(crate) directory: PathBuf,
     temporary: bool,
 }
 
 impl Bridge {
-    pub(super) fn prepare(override_directory: Option<&Path>) -> std::io::Result<Self> {
+    pub(crate) fn prepare(override_directory: Option<&Path>) -> std::io::Result<Self> {
+        Self::prepare_for_agent_dir(override_directory, None)
+    }
+
+    /// Prepare the bridge using the same Pi agent directory that a native
+    /// harness launch will pass to the child.  ACP used the inherited process
+    /// environment; native Pi keeps an explicit `with_agent_dir` test seam.
+    pub(crate) fn prepare_for_agent_dir(
+        override_directory: Option<&Path>,
+        agent_dir_override: Option<&Path>,
+    ) -> std::io::Result<Self> {
         if let Some(directory) = override_directory {
             fs::create_dir_all(directory)?;
             return Ok(Self {
@@ -26,18 +36,21 @@ impl Bridge {
         }
         let home = crate::executable::home_dir()
             .ok_or_else(|| std::io::Error::other("Pi context bridge requires a home directory"))?;
-        let agent_dir = match std::env::var_os("PI_CODING_AGENT_DIR").filter(|s| !s.is_empty()) {
-            Some(path) => {
-                let path = PathBuf::from(path);
-                if path == Path::new("~") {
-                    home.clone()
-                } else if let Ok(suffix) = path.strip_prefix("~/") {
-                    home.join(suffix)
-                } else {
-                    path
+        let agent_dir = match agent_dir_override {
+            Some(path) => path.to_owned(),
+            None => match std::env::var_os("PI_CODING_AGENT_DIR").filter(|s| !s.is_empty()) {
+                Some(path) => {
+                    let path = PathBuf::from(path);
+                    if path == Path::new("~") {
+                        home.clone()
+                    } else if let Ok(suffix) = path.strip_prefix("~/") {
+                        home.join(suffix)
+                    } else {
+                        path
+                    }
                 }
-            }
-            None => home.join(".pi/agent"),
+                None => home.join(".pi/agent"),
+            },
         };
         install_extension(&agent_dir)?;
         let directory =

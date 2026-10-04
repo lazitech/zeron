@@ -61,8 +61,8 @@ use tokio::sync::watch;
 
 use zeron_doc::{MessagePart, SessionCommandPayload};
 use zeron_proto::{
-    ChatConfig, CreateWorktreeOutcome, EngineInfo, HarnessId, ProjectActionDraft, Space, ToolCall,
-    UsageCoverage, WorkspaceScope,
+    ChatConfig, CreateWorktreeOutcome, EngineInfo, HarnessId, HarnessUpdatePolicy,
+    ProjectActionDraft, Space, ToolCall, UsageCoverage, WorkspaceScope,
 };
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
@@ -113,6 +113,28 @@ async fn update_harness_enabled(
     registry
         .set_enabled(harness, enabled)
         .map_err(RpcError::Failed)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HarnessUpdateParams {
+    #[serde(default)]
+    harness: Option<HarnessId>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DismissHarnessUpdateParams {
+    harness: HarnessId,
+    #[serde(default)]
+    version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetHarnessUpdatePolicyParams {
+    harness: HarnessId,
+    policy: HarnessUpdatePolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -604,6 +626,7 @@ pub struct EngineRpc {
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<zeron_update::Updater>,
+    harness_updates: Option<crate::harness_updates::HarnessUpdateCoordinator>,
     local_import: Option<crate::local_import::LocalImporter>,
     native_usage_index: Option<std::sync::Arc<NativeUsageIndex>>,
     engine_info: EngineInfo,
@@ -649,6 +672,7 @@ impl EngineRpc {
             auth: None,
             links: None,
             updater: None,
+            harness_updates: None,
             local_import: None,
             native_usage_index: None,
             engine_info,
@@ -678,6 +702,14 @@ impl EngineRpc {
         self
     }
 
+    pub fn with_harness_updates(
+        mut self,
+        coordinator: crate::harness_updates::HarnessUpdateCoordinator,
+    ) -> Self {
+        self.harness_updates = Some(coordinator);
+        self
+    }
+
     /// Attach the local→synced profile importer (synced runtimes only).
     pub fn with_local_import(mut self, importer: crate::local_import::LocalImporter) -> Self {
         self.local_import = Some(importer);
@@ -703,6 +735,14 @@ impl EngineRpc {
         self.updater
             .as_ref()
             .ok_or_else(|| RpcError::Failed("updates unavailable".into()))
+    }
+
+    fn harness_updates(
+        &self,
+    ) -> Result<&crate::harness_updates::HarnessUpdateCoordinator, RpcError> {
+        self.harness_updates
+            .as_ref()
+            .ok_or_else(|| RpcError::Failed("agent updates unavailable".into()))
     }
 
     fn local_importer(&self) -> Result<&crate::local_import::LocalImporter, RpcError> {
@@ -1001,7 +1041,9 @@ impl EngineRpc {
             // only unary calls below get the reply deadline.
             if matches!(
                 method,
-                methods::WATCH_CHECKOUT_CHANGE_REQUEST | methods::WATCH_WORKSPACE_GIT_STATUS
+                methods::WATCH_CHECKOUT_CHANGE_REQUEST
+                    | methods::WATCH_WORKSPACE_GIT_STATUS
+                    | methods::WATCH_HARNESS_UPDATES
             ) {
                 let rx = match client.subscribe_checked(method, params).await {
                     Ok(rx) => rx,
@@ -1284,6 +1326,12 @@ fn forward_deadline(method: &str) -> std::time::Duration {
             Duration::from_secs(15 * 60)
         }
         methods::INSTALL_HARNESS => Duration::from_secs(15 * 60),
+        // A full fleet of enabled providers is checked two at a time; each
+        // provider may need both a CLI probe and a network request.
+        methods::CHECK_HARNESS_UPDATES => Duration::from_secs(4 * 60),
+        // Leave headroom beyond the provider's 15-minute mutation timeout for
+        // queueing, verification, and the relayed response itself.
+        methods::APPLY_HARNESS_UPDATE => Duration::from_secs(20 * 60),
         methods::CREATE_WORKTREE => Duration::from_secs(120),
         // Allow the adapter discovery budget plus relay and shutdown overhead.
         methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
@@ -1345,6 +1393,8 @@ fn forwardable(method: &str) -> bool {
             | methods::SEARCH_WORKSPACE_FILES
             | methods::READ_WORKSPACE_IMAGE
             | methods::READ_WORKSPACE_FILE
+            | methods::DELETE_WORKSPACE_ENTRY
+            | methods::MOVE_WORKSPACE_ENTRY
             | methods::WRITE_WORKSPACE_FILE
             | methods::WATCH_WORKSPACE_FILES
             | methods::CREATE_WORKTREE
@@ -1384,6 +1434,12 @@ fn forwardable(method: &str) -> bool {
             // Updates report/apply on the device whose binary they concern.
             | methods::UPDATE_STATUS
             | methods::APPLY_UPDATE
+            | methods::WATCH_HARNESS_UPDATES
+            | methods::CHECK_HARNESS_UPDATES
+            | methods::APPLY_HARNESS_UPDATE
+            | methods::CANCEL_HARNESS_UPDATE
+            | methods::DISMISS_HARNESS_UPDATE
+            | methods::SET_HARNESS_UPDATE_POLICY
     )
 }
 
@@ -1399,6 +1455,7 @@ fn is_stream_method(method: &str) -> bool {
             | methods::WATCH_CHECKOUT_CHANGE_REQUEST
             | methods::WATCH_WORKSPACE_FILES
             | methods::UPDATE_STATUS
+            | methods::WATCH_HARNESS_UPDATES
     )
 }
 
@@ -1809,19 +1866,28 @@ impl RpcService for EngineRpc {
             methods::SET_HARNESS_ENABLED => {
                 let p: SetHarnessEnabledParams = parse_params(params)?;
                 update_harness_enabled(&self.registry, p.harness, p.enabled).await?;
+                if let Some(coordinator) = &self.harness_updates {
+                    coordinator.refresh_enabled();
+                }
                 // Fresh catalog in the reply: the page repaints from it in one
                 // round trip, and a refused/raced toggle self-corrects.
                 RpcReply::value(&self.registry.descriptors())
             }
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
+                let lease = std::sync::Arc::new(self.registry.execution_lease(p.harness).await);
                 let harness = self
                     .registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let models = crate::model_catalogs::list(self.repos.data_dir(), harness, p.force)
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let models = crate::model_catalogs::list_with_lease(
+                    self.repos.data_dir(),
+                    harness,
+                    p.force,
+                    Some(lease),
+                )
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
             }
             methods::LIST_SKILLS => {
@@ -1845,12 +1911,9 @@ impl RpcService for EngineRpc {
                         path: p.path,
                     })
                     .await?;
-                let harness = self
+                let skills = self
                     .registry
-                    .resolve(p.harness)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let skills = harness
-                    .skills(&root)
+                    .discover_skills(p.harness, &root)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&skills)
@@ -1876,12 +1939,9 @@ impl RpcService for EngineRpc {
                         path: p.path,
                     })
                     .await?;
-                let harness = self
+                let commands = self
                     .registry
-                    .resolve(p.harness)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let commands = harness
-                    .commands_for(&root)
+                    .discover_commands(p.harness, &root)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&commands)
@@ -2406,6 +2466,60 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&serde_json::json!({ "ok": true, "version": version }))
+            }
+            methods::WATCH_HARNESS_UPDATES => Ok(RpcReply::Stream(watch_stream(
+                self.harness_updates()?.watch(),
+            ))),
+            methods::CHECK_HARNESS_UPDATES => {
+                let p: HarnessUpdateParams = parse_params(params)?;
+                let coordinator = self.harness_updates()?.clone();
+                // Provider checks are engine-owned once accepted. If a
+                // Settings view closes or a relay drops, the request future
+                // may disappear; detaching the work prevents a permanent
+                // `Checking` status and still publishes the result by watch.
+                let statuses = tokio::spawn(async move {
+                    if let Some(harness) = p.harness {
+                        coordinator.check_one(harness).await?;
+                    } else {
+                        coordinator.check_all().await;
+                    }
+                    Ok::<_, String>(coordinator.snapshot())
+                })
+                .await
+                .map_err(|error| {
+                    RpcError::Failed(format!("agent update check task failed: {error}"))
+                })?
+                .map_err(RpcError::Failed)?;
+                RpcReply::value(&statuses)
+            }
+            methods::APPLY_HARNESS_UPDATE => {
+                let p: HarnessUpdateParams = parse_params(params)?;
+                let harness = p
+                    .harness
+                    .ok_or_else(|| RpcError::BadParams("harness is required".into()))?;
+                let version = self
+                    .harness_updates()?
+                    .apply(harness)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true, "version": version }))
+            }
+            methods::CANCEL_HARNESS_UPDATE => {
+                let p: HarnessUpdateParams = parse_params(params)?;
+                let harness = p
+                    .harness
+                    .ok_or_else(|| RpcError::BadParams("harness is required".into()))?;
+                RpcReply::value(&serde_json::json!({
+                    "cancelled": self.harness_updates()?.cancel(harness),
+                }))
+            }
+            methods::DISMISS_HARNESS_UPDATE => {
+                let p: DismissHarnessUpdateParams = parse_params(params)?;
+                RpcReply::value(&self.harness_updates()?.dismiss(p.harness, p.version))
+            }
+            methods::SET_HARNESS_UPDATE_POLICY => {
+                let p: SetHarnessUpdatePolicyParams = parse_params(params)?;
+                RpcReply::value(&self.harness_updates()?.set_policy(p.harness, p.policy))
             }
             methods::MUTATE => {
                 let p: MutateParams = parse_params(params)?;
@@ -3024,6 +3138,24 @@ impl RpcService for EngineRpc {
                 .map_err(|_| RpcError::Failed("workspace file read timed out".into()))?
                 .map_err(RpcError::from)?;
                 RpcReply::value(&file)
+            }
+            methods::DELETE_WORKSPACE_ENTRY => {
+                let request: zeron_proto::DeleteWorkspaceEntryRequest = parse_params(params)?;
+                let outcome = self
+                    .workspace_files
+                    .delete_entry(request)
+                    .await
+                    .map_err(RpcError::from)?;
+                RpcReply::value(&outcome)
+            }
+            methods::MOVE_WORKSPACE_ENTRY => {
+                let request: zeron_proto::MoveWorkspaceEntryRequest = parse_params(params)?;
+                let outcome = self
+                    .workspace_files
+                    .move_entry(request)
+                    .await
+                    .map_err(RpcError::from)?;
+                RpcReply::value(&outcome)
             }
             methods::WRITE_WORKSPACE_FILE => {
                 let request: zeron_proto::WriteWorkspaceFileRequest = parse_params(params)?;
@@ -3825,6 +3957,8 @@ mod tests {
         assert!(forwardable(methods::SEARCH_WORKSPACE_FILES));
         assert!(forwardable(methods::READ_WORKSPACE_FILE));
         assert!(forwardable(methods::READ_WORKSPACE_IMAGE));
+        assert!(forwardable(methods::DELETE_WORKSPACE_ENTRY));
+        assert!(forwardable(methods::MOVE_WORKSPACE_ENTRY));
         assert!(forwardable(methods::WRITE_WORKSPACE_FILE));
         assert!(forwardable(methods::WATCH_WORKSPACE_FILES));
         assert!(forwardable(methods::WATCH_WORKSPACE_GIT_STATUS));
@@ -3834,6 +3968,10 @@ mod tests {
         assert!(!is_stream_method(methods::WRITE_WORKSPACE_FILE));
         assert!(is_stream_method(methods::WATCH_WORKSPACE_FILES));
         assert!(is_stream_method(methods::WATCH_WORKSPACE_GIT_STATUS));
+        assert!(forwardable(methods::WATCH_HARNESS_UPDATES));
+        assert!(is_stream_method(methods::WATCH_HARNESS_UPDATES));
+        assert!(forwardable(methods::CHECK_HARNESS_UPDATES));
+        assert!(forwardable(methods::APPLY_HARNESS_UPDATE));
     }
 
     /// Every forwardable unary method gets a bounded reply deadline —
@@ -3855,6 +3993,14 @@ mod tests {
         assert_eq!(
             forward_deadline(methods::CLONE_REPO),
             Duration::from_secs(15 * 60)
+        );
+        assert_eq!(
+            forward_deadline(methods::APPLY_HARNESS_UPDATE),
+            Duration::from_secs(20 * 60)
+        );
+        assert_eq!(
+            forward_deadline(methods::CHECK_HARNESS_UPDATES),
+            Duration::from_secs(4 * 60)
         );
         assert_eq!(
             forward_deadline(methods::LIST_BRANCHES),

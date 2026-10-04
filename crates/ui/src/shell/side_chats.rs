@@ -287,12 +287,11 @@ impl Shell {
                 })
                 .collect();
             for key in keys {
-                let fallback = self
-                    .right_tabs
-                    .get(&key)
-                    .and_then(|tabs| tabs.first())
-                    .copied()
-                    .unwrap_or(RightSurface::Picker);
+                self.panels.forget_right_surface(&key, surface);
+                let fallback = self.panels.right_surface_fallback(
+                    &key,
+                    self.right_tabs.get(&key).into_iter().flatten().copied(),
+                );
                 self.panels.update(&key, |panel| {
                     if panel.right_active == surface {
                         panel.right_active = fallback;
@@ -313,10 +312,12 @@ impl Shell {
         };
         let transcript = tab.transcript.clone();
         let composer = tab.composer.clone();
-        // The main composer is driven by the shell's dock (settled, docked)
-        // and fed the column width; give the side chat's the same inputs so
-        // both take the same height branch.
-        let width = self.right_visible_width(cx);
+        // Share the main chat's docked width cap and responsive padding.
+        let width = composer_target_width(
+            self.right_visible_width(cx),
+            settings::transcript_width(cx),
+            true,
+        );
         composer.update(cx, |composer, cx| {
             composer.set_dock_frame(crate::composer_dock::DockFrame::settled(true), cx);
             composer.set_available_width(width, cx);
@@ -336,7 +337,7 @@ impl Shell {
                     cx,
                 ))
         });
-        div()
+        self.chat_dropzone(("side-chat-dropzone", id), composer.clone(), cx)
             .size_full()
             .flex()
             .flex_col()
@@ -357,6 +358,7 @@ impl Shell {
                     .children(pill),
             )
             .child(div().flex_none().child(composer))
+            .child(Self::attachment_drop_overlay(Theme::of(cx)))
             .into_any_element()
     }
 }
@@ -444,6 +446,52 @@ mod tests {
                 cx,
             )
         })
+    }
+
+    #[gpui::test]
+    fn side_chat_visits_and_deletion_restore_recent_tab(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let window = shell_window(dir.path(), cx);
+        let (recent, side_id) = window
+            .update(cx, |shell, window, cx| {
+                shell.active_chat = "main".into();
+                shell.add_browser_surface(None, window, cx);
+                shell.add_browser_surface(None, window, cx);
+                let recent = RightSurface::Browser(shell.browser_seq);
+                let chat = serde_json::from_value(serde_json::json!({
+                    "id": "side", "parentChatId": "main", "deviceId": "local",
+                    "archived": false, "createdAt": Utc::now(),
+                }))
+                .unwrap();
+                shell.open_side_chat(chat, shell.panel_key(cx), cx);
+                let side_id = shell.side_chat_seq;
+                shell.add_browser_surface(None, window, cx);
+                shell.close_right_surface(RightSurface::Browser(shell.browser_seq), window, cx);
+                assert_eq!(
+                    shell.resolved_right_active(cx),
+                    RightSurface::SideChat(side_id)
+                );
+                (recent, side_id)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                shell.side_chats[&side_id]
+                    .state
+                    .update(cx, |state, cx| state.select_chat(None, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert_eq!(shell.resolved_right_active(cx), recent);
+                assert!(
+                    !shell.panels.right_tab_history[&shell.panel_key(cx)]
+                        .contains(&RightSurface::SideChat(side_id))
+                );
+            })
+            .unwrap();
     }
 
     /// "New side chat" writes nothing: the tab opens on a chat only its

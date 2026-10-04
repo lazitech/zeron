@@ -246,7 +246,7 @@ impl TurnWire {
                             "/api/session/fixture" => ("200 OK", r#"{"data":{"id":"fixture"}}"#),
                             "/api/command" => ("200 OK", r#"{"data":[]}"#),
                             // Non-empty: the catalog-sync retry loop must not stall tests.
-                            "/api/model" => ("200 OK", r#"{"data":[{"providerID":"opencode","id":"muse","name":"Muse","limit":{"context":1000},"variants":[{"id":"low"}],"enabled":true}]}"#),
+                            "/api/model" => ("200 OK", r#"{"data":[{"providerID":"opencode","id":"muse","name":"Muse","limit":{"context":1000},"variants":[{"id":"low"}],"enabled":true},{"providerID":"opencode","id":"long-context","name":"Long Context","limit":{"context":2000},"enabled":true}]}"#),
                             _ => ("200 OK", "{}"),
                         }
                         .to_owned()
@@ -304,6 +304,7 @@ impl TurnWire {
             server: Server::attached(base),
             event_tx,
             controls: RunControls {
+                execution_lease: None,
                 request_input: Box::new(move |questions| {
                     let answer = answer.expect("fixture must not ask for input");
                     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -608,6 +609,38 @@ async fn v2_wire_streams_text_and_settles_on_execution_success() {
             "text": "PONG"
         }),
     );
+    // Each step reports its own tokens; `session.usage.updated` follows with
+    // the cumulative session totals, which must not read as occupancy.
+    let step = |wire: &TurnWire, message: &str, model: &str, tokens: Value, cumulative: Value| {
+        wire.v2(
+            "session.step.started",
+            json!({
+                "sessionID": "fixture",
+                "assistantMessageID": message,
+                "model": {"id": model, "providerID": "opencode"},
+            }),
+        );
+        wire.v2(
+            "session.step.ended",
+            json!({
+                "sessionID": "fixture", "assistantMessageID": message,
+                "finish": "stop", "cost": 0, "tokens": tokens,
+            }),
+        );
+        wire.v2(
+            "session.usage.updated",
+            json!({"sessionID": "fixture", "cost": 0, "tokens": cumulative}),
+        );
+    };
+    wire.v2(
+        "session.step.ended",
+        json!({
+            "sessionID": "fixture", "assistantMessageID": "msg_a",
+            "finish": "stop", "cost": 0,
+            "tokens": {"input": 10, "output": 2, "reasoning": 0,
+                       "cache": {"read": 0, "write": 0}}
+        }),
+    );
     wire.v2(
         "session.usage.updated",
         json!({
@@ -616,36 +649,93 @@ async fn v2_wire_streams_text_and_settles_on_execution_success() {
                        "cache": {"read": 0, "write": 0}}
         }),
     );
+    // A model switch resolves the new model's advertised window.
+    step(
+        &wire,
+        "msg_b",
+        "long-context",
+        json!({"input": 20, "output": 3, "reasoning": 0, "cache": {"read": 5, "write": 0}}),
+        json!({"input": 30, "output": 5, "reasoning": 0, "cache": {"read": 5, "write": 0}}),
+    );
+    // A step without reported usage is not an empty context.
+    step(
+        &wire,
+        "msg_c",
+        "long-context",
+        json!({"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}),
+        json!({"input": 30, "output": 5, "reasoning": 0, "cache": {"read": 5, "write": 0}}),
+    );
+    // After compaction the next prompt is smaller; the totals keep climbing.
+    step(
+        &wire,
+        "msg_d",
+        "long-context",
+        json!({"input": 4, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}}),
+        json!({"input": 34, "output": 6, "reasoning": 0, "cache": {"read": 5, "write": 0}}),
+    );
     wire.v2(
         "session.execution.succeeded",
         json!({"sessionID": "fixture"}),
     );
 
-    let (status, text, usage) = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut text = String::new();
-        let mut usage = None;
-        loop {
-            match wire.events.recv().await.unwrap().unwrap() {
-                AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
-                AgentEvent::SessionUsage { usage: snapshot } => {
-                    usage = Some(snapshot);
+    let (status, text, usage, session_usages, context_usage) =
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut text = String::new();
+            let mut usage = None;
+            let mut session_usages = Vec::new();
+            let mut context_usage = Vec::new();
+            loop {
+                match wire.events.recv().await.unwrap().unwrap() {
+                    AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+                    AgentEvent::Usage {
+                        input_tokens,
+                        output_tokens,
+                    } => {
+                        usage = Some((input_tokens, output_tokens));
+                    }
+                    AgentEvent::SessionUsage { usage } => session_usages.push(usage),
+                    AgentEvent::ContextUsage { tokens, window } => {
+                        context_usage.push((tokens, window));
+                    }
+                    AgentEvent::Done { status, .. } => {
+                        return (status, text, usage, session_usages, context_usage);
+                    }
+                    _ => {}
                 }
-                AgentEvent::Done { status, .. } => return (status, text, usage),
-                _ => {}
             }
-        }
-    })
-    .await
-    .unwrap();
+        })
+        .await
+        .unwrap();
     assert_eq!(status, DoneStatus::Completed);
     assert_eq!(text, "PONG");
+    assert_eq!(usage, Some((4, 1)));
     assert_eq!(
-        usage,
-        Some(SessionUsage {
-            input_tokens: Some(10),
-            output_tokens: Some(2),
-            cached_input_tokens: Some(0),
-        })
+        session_usages,
+        vec![
+            SessionUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(2),
+                cached_input_tokens: Some(0),
+            },
+            SessionUsage {
+                input_tokens: Some(35),
+                output_tokens: Some(5),
+                cached_input_tokens: Some(5),
+            },
+            SessionUsage {
+                input_tokens: Some(39),
+                output_tokens: Some(6),
+                cached_input_tokens: Some(5),
+            },
+        ]
+    );
+    assert_eq!(
+        context_usage,
+        vec![
+            (Some(12), Some(1000)),
+            (Some(28), Some(2000)),
+            (Some(5), Some(2000)),
+        ]
     );
 }
 
@@ -1314,13 +1404,22 @@ fn tool_names_type_the_common_calls() {
         "todowrite",
         &json!({"todos": [
             {"content": "step one", "status": "completed"},
-            {"content": "step two", "status": "pending"},
+            {"content": "step two", "status": "in_progress"},
+            {"content": "step three", "status": "pending"},
+            {"content": "step four", "status": "cancelled"},
         ]}),
     );
-    assert!(matches!(
-        &call,
-        ToolCall::Todo { items } if items.len() == 2 && items[0].done && !items[1].done
-    ));
+    assert_eq!(
+        call,
+        ToolCall::Todo {
+            items: vec![
+                TodoItem::new("step one", TodoStatus::Completed),
+                TodoItem::new("step two", TodoStatus::InProgress),
+                TodoItem::new("step three", TodoStatus::Pending),
+                TodoItem::new("step four", TodoStatus::Pending),
+            ]
+        }
+    );
     let call = oc_tool_call("mystery", &json!({"x": 1}));
     assert!(matches!(&call, ToolCall::Unknown { name, input: Some(_) } if name == "mystery"));
     assert!(!call.is_subagent_spawn());
@@ -1482,12 +1581,27 @@ fn v2_frames_normalize_to_v1_payloads() {
             "type":"tool","tool":"read",
             "state":{"status":"running","input":{"path":"/tmp/x"}}}}})]
     );
-    // Usage totals reach the engine as a dedicated cumulative event; they are
-    // not an assistant message and must not enter the context feed.
+    // A step's own usage reaches the engine as an assistant message.updated.
     let out = normalize_v2_frame(
-        json!({"id":"evt_9","type":"session.usage.updated","data":{
-            "sessionID":"ses_1","cost":0,
+        json!({"id":"evt_9","type":"session.step.ended","data":{
+            "sessionID":"ses_1","assistantMessageID":"msg_a","finish":"stop","cost":0,
             "tokens":{"input":10,"output":2,"reasoning":0,"cache":{"read":0,"write":0}}}}),
+        &mut tools,
+    );
+    assert_eq!(
+        out,
+        vec![json!({"type":"message.updated","properties":{
+            "info":{"sessionID":"ses_1","id":"usage","role":"assistant",
+                    "tokens":{"input":10,"output":2,"reasoning":0,
+                              "cache":{"read":0,"write":0}}}}})]
+    );
+    // Cumulative totals remain a dedicated event so they update billing
+    // snapshots without entering context occupancy.
+    let out = normalize_v2_frame(
+        json!({"id":"evt_10","type":"session.usage.updated","data":{
+            "sessionID":"ses_1","cost":0,
+            "tokens":{"input":10,"output":2,"reasoning":0,
+                       "cache":{"read":0,"write":0}}}}),
         &mut tools,
     );
     assert_eq!(
@@ -1496,6 +1610,58 @@ fn v2_frames_normalize_to_v1_payloads() {
             "sessionID":"ses_1",
             "tokens":{"input":10,"output":2,"reasoning":0,
                        "cache":{"read":0,"write":0}}}})]
+    );
+    // Cumulative session totals are spend, not occupancy; malformed step
+    // usage is dropped.
+    for data in [
+        json!({"id":"evt_11","type":"session.step.ended","data":{
+            "sessionID":"ses_1","assistantMessageID":"msg_a","tokens":"12"}}),
+        json!({"id":"evt_11","type":"session.step.ended","data":{
+            "sessionID":"ses_1","assistantMessageID":"msg_a"}}),
+    ] {
+        assert_eq!(normalize_v2_frame(data, &mut tools), Vec::<Value>::new());
+    }
+    // step.ended omits model identity; the session's latest step supplies
+    // it so the context window resolves downstream.
+    let mut session_models = HashMap::new();
+    let step = normalize_v2_frame_with_session_models(
+        json!({"id":"evt_12","type":"session.step.started","data":{
+            "sessionID":"ses_2","assistantMessageID":"msg_b",
+            "model":{"id":"long-context","providerID":"opencode"}}}),
+        &mut tools,
+        &mut session_models,
+    );
+    assert_eq!(step.len(), 1);
+    let out = normalize_v2_frame_with_session_models(
+        json!({"id":"evt_13","type":"session.step.ended","data":{
+            "sessionID":"ses_2","assistantMessageID":"msg_b","finish":"stop","cost":0,
+            "tokens":{"input":1,"output":2}}}),
+        &mut tools,
+        &mut session_models,
+    );
+    assert_eq!(
+        out,
+        vec![json!({"type":"message.updated","properties":{
+            "info":{"sessionID":"ses_2","id":"usage","role":"assistant",
+                    "tokens":{"input":1,"output":2},
+                    "providerID":"opencode","modelID":"long-context"}}})]
+    );
+    // A malformed model leaves the cached one in place.
+    for model in [
+        json!(null),
+        json!("opencode/muse"),
+        json!({"id":"", "providerID":"opencode"}),
+    ] {
+        normalize_v2_frame_with_session_models(
+            json!({"id":"evt_14","type":"session.step.started","data":{
+                "sessionID":"ses_2","assistantMessageID":"msg_c","model":model}}),
+            &mut tools,
+            &mut session_models,
+        );
+    }
+    assert_eq!(
+        session_models.get("ses_2").map(|m| m.model_id.as_str()),
+        Some("long-context")
     );
     // The permission ask keeps its 1.x name on 2.x (observed live when a
     // tool reaches outside the workspace); the auto-approver replies.
@@ -1823,6 +1989,29 @@ async fn v2_pending_tool_overflow_fails_the_run_instead_of_growing_forever() {
         wire.v2("session.tool.input.started",json!({"sessionID":"other","assistantMessageID":"m","id":format!("c{i}"),"name":"read"}));
     }
     assert_eq!(wire.done().await.0, DoneStatus::Errored);
+}
+
+#[tokio::test]
+async fn v2_session_model_overflow_drops_the_cache_instead_of_failing_the_run() {
+    let mut wire = TurnWire::start_proto(false, true).await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    wire.v2("session.execution.started", json!({"sessionID": "fixture"}));
+    for i in 0..=MAX_V2_SESSION_MODELS {
+        wire.v2(
+            "session.step.started",
+            json!({
+                "sessionID": format!("other-{i}"),
+                "assistantMessageID": "m",
+                "model": {"id": "muse", "providerID": "opencode"},
+            }),
+        );
+    }
+    wire.v2(
+        "session.execution.succeeded",
+        json!({"sessionID": "fixture"}),
+    );
+    assert_eq!(wire.done().await.0, DoneStatus::Completed);
 }
 
 #[tokio::test]
