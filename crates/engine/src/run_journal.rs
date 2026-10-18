@@ -627,7 +627,11 @@ mod tests {
         for (name, bytes) in tail_cases() {
             let path = dir.path().join(format!("{name}.jsonl"));
             std::fs::write(&path, &bytes).unwrap();
-            let all = read_lines(&path).unwrap();
+            let all: Vec<(u64, AgentEvent)> = read_lines(&path)
+                .unwrap()
+                .into_iter()
+                .map(|record| (record.seq, record.event))
+                .collect();
 
             // Every valid event, newest-first.
             let mut expected = all.clone();
@@ -670,8 +674,12 @@ mod tests {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            let last = read_lines(&path).unwrap().into_iter().next_back();
-            if matches!(last, Some((_, ref event)) if !matches!(event, AgentEvent::Done { .. })) {
+            let last = read_lines(&path)
+                .unwrap()
+                .into_iter()
+                .next_back()
+                .map(|record| record.event);
+            if matches!(last, Some(ref event) if !matches!(event, AgentEvent::Done { .. })) {
                 expected.push(path.file_stem().unwrap().to_str().unwrap().to_string());
             }
         }

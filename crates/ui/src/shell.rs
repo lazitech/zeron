@@ -1946,7 +1946,9 @@ impl Render for SidebarPane {
             let theme = Theme::of(cx).clone();
             match shell.route {
                 Route::Settings(section) => shell.render_settings_nav(section, &theme, window, cx),
-                Route::Chat | Route::Statistics => shell.render_chat_sidebar(&theme, cx),
+                Route::Chat | Route::Statistics | Route::PullRequests => {
+                    shell.render_chat_sidebar(&theme, cx)
+                }
             }
         });
         div().size_full().child(inner).into_any_element()
