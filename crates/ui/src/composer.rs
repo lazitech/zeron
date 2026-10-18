@@ -11656,6 +11656,7 @@ impl Render for Composer {
                                             .pr(px(10.0))
                                             .child(self.account_usage.clone()),
                                         self.state.clone(),
+                                        cx,
                                     ),
                                 ),
                         )

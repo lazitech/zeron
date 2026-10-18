@@ -110,43 +110,6 @@ fn with_separators(count: u64) -> String {
     grouped
 }
 
-/// The legacy context indicator remains available to callers that only need
-/// the local session-usage tooltip. The account-usage footer wraps its own
-/// ring cluster with [`with_session_tooltip`] so the upstream account quota
-/// ring and this session detail card share one hover surface.
-pub fn render(
-    usage: Option<ContextUsage>,
-    state: Entity<crate::state::AppState>,
-    theme: &Theme,
-) -> gpui::Stateful<gpui::Div> {
-    let fraction = usage.and_then(ContextUsage::fraction).unwrap_or(0.0) as f32;
-    let color = match usage.and_then(ContextUsage::fraction) {
-        Some(f) if f >= 0.9 => theme.danger,
-        Some(f) if f >= 0.75 => theme.warning,
-        Some(_) => theme.text_muted,
-        None => theme.text_faint,
-    };
-    let label = usage
-        .and_then(ContextUsage::fraction)
-        .map(|f| format!("{:.0}%", f * 100.0))
-        .unwrap_or_else(|| "—".into());
-    let indicator = div()
-        .id("context-usage")
-        .flex_none()
-        .flex()
-        .items_center()
-        .gap(px(5.0))
-        .h(px(24.0))
-        .px(px(6.0))
-        .rounded(px(6.0))
-        .text_size(px(11.0))
-        .text_color(color)
-        .hover(|s| s.bg(crate::theme::ink(0.05)))
-        .child(ring(fraction, color, theme))
-        .child(SharedString::from(label));
-    with_session_tooltip(indicator, state)
-}
-
 /// Whether the context ring has a reported window to measure against.
 pub fn has_window(usage: Option<ContextUsage>) -> bool {
     usage
@@ -234,10 +197,18 @@ pub struct UsageCard {
 /// Add the session token tooltip to a footer element without changing its
 /// visual children. This lets the upstream account quota and context rings
 /// remain a single cluster while retaining the local token details.
+///
+/// Only harnesses that report cumulative session totals (Codex, OpenCode,
+/// Pi) have anything to show; without a snapshot the card would be three
+/// dashes over the account ring, so no tooltip is attached.
 pub fn with_session_tooltip(
     element: gpui::Stateful<gpui::Div>,
     state: Entity<crate::state::AppState>,
+    cx: &gpui::App,
 ) -> gpui::Stateful<gpui::Div> {
+    if state.read(cx).session_usage.is_none() {
+        return element;
+    }
     element.tooltip(move |_, cx| {
         cx.new(|cx| UsageCard {
             _subscription: cx.observe(&state, |_, _, cx| cx.notify()),
@@ -315,6 +286,32 @@ mod tests {
     }
 
     #[test]
+    fn missing_usage_is_distinct_from_zero_and_overflow() {
+        assert!(details(None).contains("not reported"));
+        assert!(
+            details(Some(ContextUsage {
+                tokens: Some(0),
+                window: Some(200)
+            }))
+            .contains("200 tokens remaining")
+        );
+        assert!(
+            details(Some(ContextUsage {
+                tokens: Some(250),
+                window: Some(200)
+            }))
+            .contains("0 tokens remaining")
+        );
+        assert!(
+            details(Some(ContextUsage {
+                tokens: Some(10),
+                window: Some(0)
+            }))
+            .contains("limit not reported")
+        );
+    }
+
+    #[test]
     fn session_usage_without_context_still_shows_indicator() {
         assert!(!has_any_usage(None, None));
         assert!(has_any_usage(
@@ -333,7 +330,13 @@ mod tests {
         assert_eq!(with_separators(999), "999");
         assert_eq!(with_separators(5417), "5,417");
         assert_eq!(with_separators(1_048_576), "1,048,576");
-        assert_eq!(token_value(Some(1_048_576)), "1,048,576");
+        assert_eq!(
+            details(Some(ContextUsage {
+                tokens: Some(5417),
+                window: Some(1_048_576)
+            })),
+            "5,417 / 1,048,576 tokens\n1,043,159 tokens remaining"
+        );
     }
 
     #[test]

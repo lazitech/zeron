@@ -2222,6 +2222,7 @@ async fn drive_run(
     let harness_id = harness.id();
     let user_prompt = request.prompt.clone();
     let run_cwd = request.cwd.clone();
+    let requested_resume = request.resume.clone();
     if request.resume.is_none() {
         let _ = doc.clear_context_usage();
         let _ = doc.clear_session_usage();
@@ -2397,6 +2398,9 @@ async fn drive_run(
     let mut interrupt_deadline: Option<tokio::time::Instant> = None;
     let mut interrupted = false;
     let mut saw_session_started = false;
+    // A snapshot already reported by this run belongs to the session that is
+    // actually running, so a later SessionStarted must not discard it.
+    let mut saw_session_usage = false;
     // Liveness heartbeat: this loop RUNNING is proof the harness stream is
     // open, so freshness must not depend on events arriving. Silent stretches
     // are normal and UNBOUNDED — a long tool call, redacted thinking, an
@@ -2979,6 +2983,7 @@ async fn drive_run(
         // Cumulative counters may arrive after Done as well. Replacing the
         // snapshot is idempotent and must not reopen a completed turn.
         if let AgentEvent::SessionUsage { usage } = &event {
+            saw_session_usage = true;
             if let Err(err) = doc_ref.update_session_usage(*usage) {
                 tracing::warn!(%chat_id, error = %err, "session usage write failed");
             }
@@ -3213,6 +3218,19 @@ async fn drive_run(
             AgentEvent::SessionStarted {
                 session_id, cwd, ..
             } => {
+                // A harness may fall back to a fresh native session when the
+                // requested resume is gone (OpenCode, Pi after lost context).
+                // The stored totals then describe a session that is no longer
+                // running; clear them until the new session reports its own.
+                if !saw_session_started
+                    && !saw_session_usage
+                    && !session_id.is_empty()
+                    && requested_resume
+                        .as_deref()
+                        .is_some_and(|resume| resume != session_id)
+                {
+                    let _ = doc.clear_session_usage();
+                }
                 saw_session_started = true;
                 // The event's own cwd (where the harness actually created the
                 // session) scopes the stored id, not the request's.
@@ -4123,6 +4141,87 @@ mod tests {
                 .expect("FeedHarness serves one run per test");
             Ok(futures::stream::poll_fn(move |cx| feed.poll_recv(cx).map(|e| e.map(Ok))).boxed())
         }
+    }
+
+    /// Run a FeedHarness chat that resumes `old-native` but whose harness
+    /// reports `fresh-native`, and return the doc's session usage after the
+    /// SessionStarted has been handled.
+    async fn session_usage_after_resume_fallback(
+        report_before_start: Option<zeron_proto::SessionUsage>,
+    ) -> Option<zeron_proto::SessionUsage> {
+        use super::*;
+        let (feed, rx) = mpsc::unbounded_channel();
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(FeedHarness {
+            feed: Mutex::new(Some(rx)),
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let core =
+            crate::EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        let chat = "chat-resume-fallback";
+        let stale = zeron_proto::SessionUsage {
+            input_tokens: Some(9_000),
+            output_tokens: Some(900),
+            cached_input_tokens: Some(8_000),
+        };
+        let handle = core.doc_host.open(chat).unwrap();
+        handle.doc().update_session_usage(stale).unwrap();
+        core.sessions
+            .inner
+            .remember_harness_session(chat, "old-native", "/tmp");
+        core.sessions
+            .dispatch(chat, HarnessId::Mock, request(), None)
+            .await
+            .unwrap();
+        if let Some(usage) = report_before_start {
+            feed.send(AgentEvent::SessionUsage { usage }).unwrap();
+        }
+        feed.send(AgentEvent::SessionStarted {
+            harness: HarnessId::Mock,
+            model: "mock-1".into(),
+            tools: vec![],
+            cwd: "/tmp".into(),
+            session_id: "fresh-native".into(),
+            assistant_message_id: "a1".into(),
+        })
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while core.sessions.inner.resume_for(chat, "/tmp").as_deref() != Some("fresh-native") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let usage = handle.doc().session_usage();
+        feed.send(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+        })
+        .unwrap();
+        core.sessions.shutdown().await;
+        assert_ne!(usage, Some(stale), "stale totals must not survive");
+        usage
+    }
+
+    #[tokio::test]
+    async fn resume_fallback_to_a_new_session_clears_stale_session_usage() {
+        assert_eq!(session_usage_after_resume_fallback(None).await, None);
+    }
+
+    #[tokio::test]
+    async fn resume_fallback_keeps_a_snapshot_reported_by_the_new_session() {
+        let fresh = zeron_proto::SessionUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            cached_input_tokens: Some(0),
+        };
+        assert_eq!(
+            session_usage_after_resume_fallback(Some(fresh)).await,
+            Some(fresh)
+        );
     }
 
     // A tagged subagent event that folds to NO parts used to leave its sink

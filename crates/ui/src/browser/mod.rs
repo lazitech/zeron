@@ -132,6 +132,9 @@ pub struct BrowserSurface {
     /// The page's pointer cursor (Windows: GPUI owns the cursor).
     #[cfg(windows)]
     page_cursor: gpui::CursorStyle,
+    /// Page-history requests (`true` = forward), observable without a native page.
+    #[cfg(test)]
+    history_requests: Vec<bool>,
 }
 
 impl EventEmitter<BrowserEvent> for BrowserSurface {}
@@ -214,6 +217,8 @@ impl BrowserSurface {
             favicon_generation: 0,
             #[cfg(windows)]
             page_cursor: gpui::CursorStyle::Arrow,
+            #[cfg(test)]
+            history_requests: Vec::new(),
         }
     }
 
@@ -435,6 +440,8 @@ impl BrowserSurface {
     }
 
     fn history(&mut self, forward: bool) {
+        #[cfg(test)]
+        self.history_requests.push(forward);
         #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         if let Some(native) = &self.native {
             native.history(forward);
@@ -801,6 +808,33 @@ mod tests {
                 window.blur();
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn mouse_side_buttons_walk_page_history(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            crate::composer::init(cx, Default::default());
+            cx.set_global(crate::theme::Theme::default());
+            bind_keys(cx, &crate::settings::KeymapConfig::default());
+        });
+        let (browser, cx) = cx.add_window_view(|window, cx| {
+            BrowserSurface::new(BrowserContext::default(), false, window, cx)
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        for direction in [
+            gpui::NavigationDirection::Back,
+            gpui::NavigationDirection::Forward,
+        ] {
+            cx.simulate_mouse_down(
+                gpui::point(gpui::px(200.0), gpui::px(300.0)),
+                gpui::MouseButton::Navigate(direction),
+                gpui::Modifiers::default(),
+            );
+        }
+        browser.read_with(cx, |browser, _| {
+            assert_eq!(browser.history_requests, vec![false, true]);
+        });
     }
 
     #[gpui::test]

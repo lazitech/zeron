@@ -784,6 +784,10 @@ impl Render for BrowserSurface {
                 });
         div().id("browser-surface").size_full().flex().flex_col().track_focus(&self.focus)
             .key_context("Browser").on_key_down(cx.listener(Self::key_down))
+            // Mouse side buttons walk this page's history and stop there, so
+            // the shell's route-history fallback never also fires. A second
+            // stop-only listener on this element would run first (bubble
+            // order is reversed) and silently swallow these.
             .on_mouse_down(
                 MouseButton::Navigate(gpui::NavigationDirection::Back),
                 cx.listener(|this, _, _, cx| {
@@ -810,10 +814,6 @@ impl Render for BrowserSurface {
             .on_action(cx.listener(|_, _: &super::CloseTab, _, cx| cx.emit(BrowserEvent::Close)))
             .on_action(cx.listener(|this, _: &super::Back, _, _| this.history(false)))
             .on_action(cx.listener(|this, _: &super::Forward, _, _| this.history(true)))
-            // Mouse side buttons drive the shell's route history everywhere
-            // else; over the browser they are inert.
-            .on_mouse_down(MouseButton::Navigate(gpui::NavigationDirection::Back), |_, _, cx| cx.stop_propagation())
-            .on_mouse_down(MouseButton::Navigate(gpui::NavigationDirection::Forward), |_, _, cx| cx.stop_propagation())
             .child(toolbar)
             .when_some(persistence_notice, |el, message| el.child(div().px(px(12.0)).py(px(8.0))
                 .text_size(crate::typography::ui_rems(11.0)).text_color(theme.text_muted).child(message.to_owned())))
