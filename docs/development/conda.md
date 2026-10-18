@@ -75,3 +75,48 @@ the repository with the environment active. For example:
 cargo fmt --all
 cargo run -p zeron
 ```
+
+## Reclaim space after a desktop build
+
+After a successful build, preview and run the cleanup script:
+
+```sh
+./scripts/cleanup-after-build.py --dry-run
+./scripts/cleanup-after-build.py
+```
+
+It preserves `target/debug/zeron` and `target/release/zeron` when present,
+removes their DWARF debug symbols, and deletes the other files in those build
+profiles, including intermediate files, test executables, and library outputs.
+The browser helper and UI assets are embedded in the desktop executable. Launch
+the retained program directly with `zeron` or `./target/debug/zeron`.
+
+By default it also removes Cargo's registry/git downloads and the installed
+Rust toolchains inside `zeron-dev`. It keeps the Conda environment, Rustup
+installation entry point, and native build dependencies. It does not touch
+Zeron's sessions, settings, statistics, or the separate system Cargo cache.
+Use `--keep-rust` to retain Rust and its downloads, or `--keep-debug-symbols`
+to keep the executable's debugging information. An alternate Conda installation
+can be selected with `--dev-prefix /path/to/envs/zeron-dev`.
+
+The script requires Python 3 and binutils (`strip`). It checks that the retained
+executables run and that their shared libraries survive cleanup, and refuses
+cleanup while Cargo holds the build/cache locks or Rust is running in the
+environment. If Zeron is running, restart it after cleanup so the old executable
+can release its disk space.
+
+Before the next build, restore Rust inside the same environment:
+
+```sh
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
+conda activate zeron-dev
+./scripts/bootstrap-conda-rust.sh
+cargo build -p zeron --locked
+```
+
+That build downloads dependencies again and rebuilds from scratch. To clean
+automatically after a successful build:
+
+```sh
+cargo build -p zeron --locked && ./scripts/cleanup-after-build.py
+```

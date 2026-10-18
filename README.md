@@ -61,6 +61,30 @@ The desktop app checks for a new release when it starts, every hour while it run
 
 Linux desktop installs from the release tarball's `install.sh` use the same `~/.zeron/app` layout as the curl installer, so they update in place too. A daemon installed as a service restarts into a newer installed version once no agent run or terminal is active; `zeron update` updates headless installs on demand.
 
+## 编译后的空间清理（Linux / zeron-dev）
+
+已写好：[scripts/cleanup-after-build.py](scripts/cleanup-after-build.py)。默认保留可运行的 Zeron，删除编译中间文件、Cargo 缓存和 Rust 工具链，并去掉程序调试信息。
+
+编译完成后，在仓库根目录运行：
+
+```sh
+./scripts/cleanup-after-build.py --dry-run  # 预览
+./scripts/cleanup-after-build.py           # 清理
+```
+
+本机验证记录（2026-10-03）：程序副本实测从约 **1.95 GiB 缩到 294 MiB**，清理后 `target` 预计约 300 MiB。已通过 11 项隔离测试，**尚未实际清理你的目录**。
+
+下次编译前恢复工具链：
+
+```sh
+source /home/lazic/miniconda3/etc/profile.d/conda.sh
+conda activate zeron-dev
+./scripts/bootstrap-conda-rust.sh
+cargo build -p zeron --locked
+```
+
+清理后仍可直接运行 `zeron`；下次编译会重新下载依赖并完整构建。更多清理选项见 [Conda 开发环境说明](docs/development/conda.md#reclaim-space-after-a-desktop-build)。
+
 ## Sponsors
 
 Thank you to [The Context Company](https://www.thecontextcompany.com/) for sponsoring Zeron.
