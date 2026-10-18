@@ -41,7 +41,7 @@ pub(crate) fn text_system() -> Arc<TextSystem> {
 
 fn worker(width: f32) -> Worker {
     let ts = text_system();
-    let mut w = Worker::new(&ts, Arc::new(Shared { frame: Mutex::new(Arc::new(LayoutFrame::empty())) }), Arc::new(Quiet));
+    let mut w = Worker::new(&ts, Arc::new(Shared { frame: Mutex::new(Arc::new(LayoutFrame::empty())) }), Arc::new(Quiet), None);
     w.width = width;
     w
 }
@@ -464,15 +464,31 @@ fn bench_layout_passes() {
 }
 
 #[test]
-fn user_mentions_render_as_accent_chips() {
+fn user_mentions_render_as_chips() {
+    // The desktop's chips: a soft pill with the file theme's icon on a well,
+    // the label in the body color — for files, folders, skills and commands.
     let mut w = worker(390.0);
-    let text = "Look at [mod.rs](zeron-file:crates/mobile/src/layout/mod.rs) please".to_owned();
+    let skill = zeron_proto::invocation::Invocation::Skill { name: "review".into(), path: "/repo/SKILL.md".into(), command: None };
+    let text = format!(
+        "Look at [mod.rs](zeron-file:crates/mobile/src/layout/mod.rs) in [layout](zeron-file:crates/mobile/src/layout/) with {}",
+        skill.link()
+    );
     w.input = debug_input(vec![DebugEntry { id: "u".into(), user: true, text, streaming: false }], false);
     let frame = w.pass();
     let d = frame.display(0).unwrap();
-    assert!(d.text.contains("@mod.rs"), "{}", d.text);
-    assert!(!d.text.contains("zeron-file:"));
-    assert!(d.runs.iter().any(|r| r.color == display::ColorRole::Link));
+    assert!(d.text.contains("mod.rs") && !d.text.contains("@mod.rs"), "{}", d.text);
+    assert!(!d.text.contains("zeron-"), "{}", d.text);
+    assert!(d.runs.iter().all(|r| r.color != display::ColorRole::Link));
+    let icons: Vec<&str> = d
+        .widgets
+        .iter()
+        .filter_map(|w| match &w.kind {
+            display::WidgetKind::Icon { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(icons, ["fileicon-files-rust", "fileicon-folders-folder", "wand.and.stars"]);
+    assert_eq!(d.boxes.iter().filter(|b| b.color == display::ColorRole::ToolBadge).count(), 3);
 }
 
 #[test]
@@ -485,6 +501,35 @@ fn user_attachments_render_as_images_not_trailer_text() {
     assert!(!d.text.contains("Attached images"), "{}", d.text);
     assert!(d.text.contains("Fix the header spacing"));
     assert!(d.widgets.iter().any(|w| matches!(&w.kind, display::WidgetKind::Image { reference } if reference.ends_with("shot.png"))));
+}
+
+#[test]
+fn synced_file_attachments_render_as_chips_and_name_pills() {
+    // A desktop send mixing an image and ZIPs (one still a queued-upload ref),
+    // with composer chips in the prompt. Chipped attachments show as their
+    // chip only; the image chip opens its upload; the unchipped ZIP keeps a
+    // name pill and never reaches image loading.
+    let mut w = worker(390.0);
+    let text = "Compare [Image 1](zeron-image:1) with [notes.zip](zeron-attachment:2)\n\nAttached images (local files — open them to view):\n- /tmp/uploads/ab12cd34-Image_1.png\n- /tmp/uploads/ab12cd34-notes.zip\n- pending://up-3/logs.zip".to_owned();
+    w.input = debug_input(vec![DebugEntry { id: "u".into(), user: true, text, streaming: false }], false);
+    let frame = w.pass();
+    let d = frame.display(0).unwrap();
+    assert!(!d.widgets.iter().any(|w| matches!(&w.kind, display::WidgetKind::Image { .. })));
+    let icons: Vec<&str> = d
+        .widgets
+        .iter()
+        .filter_map(|w| match &w.kind {
+            display::WidgetKind::Icon { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    // The unchipped ZIP's pill, then the bubble's two chips.
+    assert_eq!(icons, ["fileicon-files-compressed", "photo", "fileicon-files-compressed"]);
+    assert!(d.text.contains("Compare Image 1 with notes.zip"), "{}", d.text);
+    assert!(d.text.contains("logs.zip") && !d.text.contains("ab12cd34-"), "{}", d.text);
+    assert!(!d.text.contains("zeron-image") && !d.text.contains("zeron-attachment"), "{}", d.text);
+    let links: Vec<&str> = d.links.iter().map(|l| l.url.as_str()).collect();
+    assert_eq!(links, ["zeron-preview://image?ref=%2Ftmp%2Fuploads%2Fab12cd34-Image_1.png"]);
 }
 
 #[test]
@@ -560,4 +605,46 @@ fn links_get_hit_regions() {
         let links: Vec<_> = (0..frame.row_count()).flat_map(|i| frame.display(i).unwrap().links).collect();
         assert!(!links.is_empty(), "no link hits for {md:?}");
     }
+}
+
+#[test]
+fn visual_rows_take_the_height_their_worker_measures() {
+    struct Ping(Mutex<mpsc::Sender<u64>>);
+    impl LayoutListener for Ping {
+        fn frame_ready(&self, revision: u64) {
+            let _ = self.0.lock().unwrap().send(revision);
+        }
+    }
+    let (tx, frames) = mpsc::channel();
+    let view = TranscriptView::new(text_system(), Arc::new(Ping(Mutex::new(tx))));
+    let script = r#"return ui.column { gap = 10, ui.text "Hello", ui.canvas { height = 200, draw = function(g) end } }"#;
+    view.visuals.set_fetch(Arc::new(move |path: &str| (path == "up/v1-visual.luau").then(|| script.as_bytes().to_vec())), 2.0);
+    view.set_viewport(390.0, 1.0);
+    view.set_input(TranscriptInput {
+        entries: vec![Arc::new(SessionMessageEntry {
+            id: "a1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Visual { id: "v1".into(), path: "up/v1-visual.luau".into(), title: "Chart".into() }],
+            created_at: 0,
+            device_id: String::new(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        })],
+        ..Default::default()
+    });
+    // The loading line first, then the laid-out visual (text, gap, canvas).
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    let (frame, row) = loop {
+        let _ = frames.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("a frame");
+        let frame = view.frame();
+        if let Some(row) = frame.placement(0).filter(|p| p.kind == RowKind::Visual && p.height > 200.0) {
+            break (frame, row);
+        }
+    };
+    let display = frame.display(row.index).unwrap();
+    let widget = display.widgets.iter().find(|w| matches!(&w.kind, display::WidgetKind::Visual { id } if id == "v1")).expect("a visual widget");
+    assert!((widget.y + widget.h - row.height).abs() < 0.5, "the widget fills the row below its gap");
+    assert!(view.visual("v1".into()).is_some());
+    view.close();
 }

@@ -12,6 +12,9 @@ final class TranscriptListView: UIScrollView, RowViewDelegate, UIScrollViewDeleg
     private var visible: [UInt64: RowView] = [:]
     private var pool: [RowView] = []
     private var cache: [ModelKey: RowModel] = [:]
+    /// Agent visuals by id: one live view each, moved between reused rows so
+    /// its painted state survives row reconfigures.
+    private var visuals: [String: VisualView] = [:]
     private var memoryObserver: NSObjectProtocol?
 
     deinit {
@@ -38,6 +41,8 @@ final class TranscriptListView: UIScrollView, RowViewDelegate, UIScrollViewDeleg
     var onFollowChange: ((Bool) -> Void)?
     var onDistanceFromBottom: ((CGFloat) -> Void)?
     var imageLoader: ((String, UIImageView) -> Void)?
+    /// An attachment's picture, for an image chip opened full size.
+    var imageFetcher: ((String) async -> UIImage?)?
 
     // MARK: Runway (desktop transcript.rs `OwnTurnAnchor`)
     //
@@ -571,6 +576,17 @@ final class TranscriptListView: UIScrollView, RowViewDelegate, UIScrollViewDeleg
 
     func rowView(_ view: RowView, open url: URL) {
         guard let vc = findViewController() else { return }
+        // An image chip opens its upload full size, as its thumbnail did.
+        if url.scheme == "zeron-preview" {
+            guard let reference = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "ref" })?.value
+            else { return }
+            Task { @MainActor [weak self, weak view, weak vc] in
+                guard let image = await self?.imageFetcher?(reference), let view, let vc else { return }
+                vc.present(ImageViewer(image: image, source: view), animated: true)
+            }
+            return
+        }
         if url.scheme == "http" || url.scheme == "https" {
             let safari = SFSafariViewController(url: url)
             safari.preferredControlTintColor = Palette.accent
@@ -582,6 +598,18 @@ final class TranscriptListView: UIScrollView, RowViewDelegate, UIScrollViewDeleg
 
     func rowView(_ view: RowView, imageFor reference: String, into imageView: UIImageView) {
         imageLoader?(reference, imageView)
+    }
+
+    func rowView(_ view: RowView, visualFor id: String) -> UIView? {
+        if let live = visuals[id] { return live }
+        guard let session = engine.visual(id: id) else { return nil }
+        let live = VisualView(session: session, scale: traitCollection.displayScale)
+        live.openURL = { [weak self, weak live] url in
+            guard let self, let row = live?.superview as? RowView else { return }
+            self.rowView(row, open: url)
+        }
+        visuals[id] = live
+        return live
     }
 
     fileprivate func row(at point: CGPoint) -> RowView? {
