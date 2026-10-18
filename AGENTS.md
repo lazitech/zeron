@@ -53,6 +53,18 @@
 - Official `main` through `9e1a1115` (v0.2.102 plus subsequent updates) was
   merged on 2026-10-03 while preserving personal changes. The pre-merge state
   is saved as `backup/personal-before-upstream-20261003-f6bd1ac5`.
+- Official `main` through `59182488` (v0.2.113, 66 commits past the prior
+  merge) was merged on 2026-10-17 while preserving personal changes. The
+  pre-merge state is saved as
+  `backup/personal-before-upstream-20261017-c9f9efa2`. The merge pulled in the
+  pull request board/detail tabs, the unified fff/content/cmd+K search
+  palette, voice input, and journal tail-read performance work; conflicts were
+  resolved by keeping both sides where additive and adopting upstream's
+  refactors where they superseded personal code without loss of behavior
+  (notably `run_journal.rs`'s tail reader, kept alongside the personal
+  skipped-line counter for usage-stats coverage). The merge also exposed one
+  genuinely dead personal dependency (`nucleo-matcher`, superseded by
+  upstream's `fff-search`), now removed.
   Later upstream updates must follow the requested workflow below, preserving
   personal changes and inspecting the resulting diff. Do not start an upstream
   update without a user request.
