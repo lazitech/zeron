@@ -96,10 +96,16 @@ impl AgentIdentity {
     }
 }
 
-#[derive(Default)]
-struct LaneUsage {
+/// One usage report kept for a lane after folding.
+#[derive(Clone, Copy)]
+struct LaneReport {
     tokens: u64,
     timestamp_ms: Option<i64>,
+}
+
+#[derive(Default)]
+struct LaneUsage {
+    reports: Vec<LaneReport>,
 }
 
 #[derive(Default)]
@@ -165,18 +171,23 @@ pub(crate) fn from_zeron_chat(input: ChatUsageInput) -> (UsageSessionInput, Usag
         }
     }
     let identity = identity.unwrap_or_else(AgentIdentity::unknown);
-    let turns = turns_from_records(&records);
+    let configured_harness = input.chat.config.as_ref().map(|config| config.harness);
+    let turns = turns_from_records(&records, configured_harness);
     let mut token_total = 0u64;
     let mut token_usage_events = Vec::new();
     let mut has_token_data = false;
     for turn in turns {
-        for lane in turn.usage_by_lane.values() {
+        for report in turn
+            .usage_by_lane
+            .values()
+            .flat_map(|lane| lane.reports.iter())
+        {
             has_token_data = true;
-            token_total = token_total.saturating_add(lane.tokens);
-            if let Some(timestamp_ms) = lane.timestamp_ms {
+            token_total = token_total.saturating_add(report.tokens);
+            if let Some(timestamp_ms) = report.timestamp_ms {
                 token_usage_events.push(TokenUsageEvent {
                     timestamp_ms,
-                    tokens: lane.tokens,
+                    tokens: report.tokens,
                 });
             }
         }
@@ -607,13 +618,28 @@ fn merge_fallback(base: &mut UsageSessionInput, fallback: UsageSessionInput) {
     }
 }
 
-fn turns_from_records(records: &[JournalRecord]) -> Vec<Turn> {
+/// Whether a harness's journal `Usage` events report one API call each.
+///
+/// The Pi driver emits `Usage` on every assistant `message_end`, so a tool
+/// using turn has several reports that must be added. The other harnesses
+/// report a snapshot for the turn (Claude's result frame, Codex's `last`
+/// counter, an ACP prompt response, OpenCode's final assistant message), so
+/// a later report replaces an earlier one in the same lane.
+fn usage_is_per_call(harness: HarnessId) -> bool {
+    matches!(harness, HarnessId::Pi)
+}
+
+fn turns_from_records(records: &[JournalRecord], default_harness: Option<HarnessId>) -> Vec<Turn> {
     let mut turns = Vec::new();
     let mut current: Option<MutableTurn> = None;
+    let mut additive = default_harness.is_some_and(usage_is_per_call);
 
     for record in records {
         match &record.event {
-            AgentEvent::SessionStarted { .. } => {
+            AgentEvent::SessionStarted { harness, .. } => {
+                // A chat can switch harnesses between runs; each root
+                // SessionStarted names the harness whose reports follow.
+                additive = usage_is_per_call(*harness);
                 current.get_or_insert_with(MutableTurn::default);
             }
             AgentEvent::Steered { .. } => {
@@ -628,7 +654,7 @@ fn turns_from_records(records: &[JournalRecord]) -> Vec<Turn> {
             }
             event => {
                 let turn = current.get_or_insert_with(MutableTurn::default);
-                visit_event(event, "", record.timestamp_ms, turn);
+                visit_event(event, "", record.timestamp_ms, additive, turn);
             }
         }
     }
@@ -642,6 +668,7 @@ fn visit_event(
     event: &AgentEvent,
     lane_id: &str,
     timestamp_ms: Option<i64>,
+    additive: bool,
     turn: &mut MutableTurn,
 ) {
     match event {
@@ -654,7 +681,7 @@ fn visit_event(
             } else {
                 format!("{lane_id}/{parent_tool_use_id}")
             };
-            visit_event(event, &child_lane, timestamp_ms, turn);
+            visit_event(event, &child_lane, timestamp_ms, additive, turn);
         }
         AgentEvent::Steered { .. } if !lane_id.is_empty() => {
             if let Some(usage) = turn.usage_by_lane.remove(lane_id) {
@@ -668,13 +695,15 @@ fn visit_event(
             input_tokens,
             output_tokens,
         } => {
-            turn.usage_by_lane.insert(
-                lane_id.to_owned(),
-                LaneUsage {
-                    tokens: (*input_tokens).saturating_add(*output_tokens),
-                    timestamp_ms,
-                },
-            );
+            let report = LaneReport {
+                tokens: (*input_tokens).saturating_add(*output_tokens),
+                timestamp_ms,
+            };
+            let lane = turn.usage_by_lane.entry(lane_id.to_owned()).or_default();
+            if !additive {
+                lane.reports.clear();
+            }
+            lane.reports.push(report);
         }
         _ => {}
     }
@@ -791,4 +820,170 @@ fn project_label(path: &str) -> Option<String> {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "Unknown project".into()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeron_proto::DoneStatus;
+
+    fn record(seq: u64, timestamp_ms: i64, event: AgentEvent) -> JournalRecord {
+        JournalRecord {
+            seq,
+            timestamp_ms: Some(timestamp_ms),
+            event,
+        }
+    }
+
+    fn started(harness: HarnessId) -> AgentEvent {
+        AgentEvent::SessionStarted {
+            harness,
+            model: "model".into(),
+            tools: Vec::new(),
+            cwd: "/repo".into(),
+            session_id: "native".into(),
+            assistant_message_id: "a1".into(),
+        }
+    }
+
+    fn usage(input_tokens: u64, output_tokens: u64) -> AgentEvent {
+        AgentEvent::Usage {
+            input_tokens,
+            output_tokens,
+        }
+    }
+
+    fn done() -> AgentEvent {
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+        }
+    }
+
+    fn reported_tokens(turns: &[Turn]) -> Vec<u64> {
+        let mut tokens: Vec<_> = turns
+            .iter()
+            .flat_map(|turn| turn.usage_by_lane.values())
+            .flat_map(|lane| lane.reports.iter().map(|report| report.tokens))
+            .collect();
+        tokens.sort_unstable();
+        tokens
+    }
+
+    #[test]
+    fn per_turn_snapshots_keep_the_latest_report() {
+        let records = [
+            record(1, 1, started(HarnessId::Codex)),
+            record(2, 2, usage(100, 10)),
+            record(3, 3, usage(300, 30)),
+            record(4, 4, done()),
+        ];
+        let turns = turns_from_records(&records, None);
+        assert_eq!(reported_tokens(&turns), vec![330]);
+    }
+
+    #[test]
+    fn pi_reports_every_api_call_and_adds_them() {
+        let records = [
+            record(1, 1, started(HarnessId::Pi)),
+            record(2, 2, usage(100, 10)),
+            record(3, 3, usage(300, 30)),
+            record(4, 4, done()),
+            // A later Codex run in the same chat folds as snapshots again.
+            record(5, 5, started(HarnessId::Codex)),
+            record(6, 6, usage(5, 5)),
+            record(7, 7, usage(7, 7)),
+            record(8, 8, done()),
+        ];
+        let turns = turns_from_records(&records, Some(HarnessId::Pi));
+        assert_eq!(reported_tokens(&turns), vec![14, 110, 330]);
+    }
+
+    #[test]
+    fn subagent_lanes_are_counted_separately() {
+        let records = [
+            record(1, 1, started(HarnessId::ClaudeCode)),
+            record(
+                2,
+                2,
+                AgentEvent::Subagent {
+                    parent_tool_use_id: "tool-1".into(),
+                    event: Box::new(usage(40, 2)),
+                },
+            ),
+            record(3, 3, usage(100, 10)),
+            record(4, 4, done()),
+        ];
+        let turns = turns_from_records(&records, None);
+        assert_eq!(reported_tokens(&turns), vec![42, 110]);
+    }
+
+    fn session(key: &str, native_id: &str, created_at_ms: i64) -> UsageSessionInput {
+        UsageSessionInput {
+            key: key.into(),
+            agent_id: "codex".into(),
+            agent_label: "Codex".into(),
+            native_session_id: Some(native_id.into()),
+            created_at_ms: Some(created_at_ms),
+            ..UsageSessionInput::default()
+        }
+    }
+
+    #[test]
+    fn matching_zeron_chat_merges_into_the_native_session() {
+        let mut native = session("codex:n1:1000", "n1", 1_000);
+        native.tokens = Some(500);
+        let mut zeron = session("zeron:chat", "n1", 1_200);
+        zeron.tokens = Some(80);
+        zeron.prompts = 3;
+        let unrelated = session("zeron:other", "n2", 1_200);
+
+        let merged = merge_sessions(vec![native], vec![zeron, unrelated]);
+        assert_eq!(merged.len(), 2);
+        let native = merged
+            .iter()
+            .find(|session| session.key == "codex:n1:1000")
+            .unwrap();
+        // Native tokens are authoritative; Zeron fills the missing prompts.
+        assert_eq!(native.tokens, Some(500));
+        assert_eq!(native.prompts, 3);
+    }
+
+    #[test]
+    fn dated_tokens_follow_events_and_skip_undated_history() {
+        let now = Local::now();
+        let now_ms = now.timestamp_millis();
+        let today = now.date_naive();
+        let long_ago = now_ms - 30 * 24 * 60 * 60 * 1000;
+
+        let mut dated = session("codex:a:1", "a", long_ago);
+        dated.tokens = Some(1_500);
+        dated.token_usage_events = vec![
+            TokenUsageEvent {
+                timestamp_ms: long_ago,
+                tokens: 1_000,
+            },
+            TokenUsageEvent {
+                timestamp_ms: now_ms,
+                tokens: 500,
+            },
+        ];
+        // An old session without dated events contributes only to lifetime
+        // totals, never to today's or this week's usage.
+        let mut undated = session("codex:b:2", "b", long_ago);
+        undated.tokens = Some(9_000);
+
+        let stats = build(vec![dated, undated], UsageCoverage::default(), now_ms);
+        assert_eq!(stats.totals.tokens, 10_500);
+        assert_eq!(stats.totals.today_tokens, Some(500));
+        assert_eq!(stats.totals.week_tokens, Some(500));
+        let today_cell = stats
+            .heatmap
+            .iter()
+            .find(|day| day.day == today.format("%Y-%m-%d").to_string())
+            .unwrap();
+        assert_eq!(today_cell.tokens, Some(500));
+    }
 }

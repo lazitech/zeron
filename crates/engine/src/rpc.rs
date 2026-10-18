@@ -1645,6 +1645,123 @@ where
     .boxed()
 }
 
+/// Build the Statistics snapshot from the native history index and this
+/// device's Zeron chats. Every source read here is synchronous file or SQLite
+/// I/O, so callers run it on the blocking pool.
+fn usage_statistics_snapshot(
+    native_usage_index: Option<&NativeUsageIndex>,
+    doc_host: &DocHost,
+    sessions: &SessionsEngine,
+    workspace: &WorkspaceHost,
+) -> zeron_proto::UsageStatistics {
+    let generated_at_ms = crate::now_ms();
+    let mut coverage = UsageCoverage {
+        last_scanned_at_ms: generated_at_ms,
+        ..UsageCoverage::default()
+    };
+    let mut native_inputs = Vec::new();
+    if let Some(index) = native_usage_index {
+        match index.refresh_and_load() {
+            Ok(snapshot) => {
+                coverage.partial |= snapshot.coverage.partial;
+                coverage.unreadable_files = coverage
+                    .unreadable_files
+                    .saturating_add(snapshot.coverage.failed_files);
+                coverage.unavailable_sources = coverage
+                    .unavailable_sources
+                    .saturating_add(snapshot.coverage.failed_adapters);
+                coverage.malformed_lines = coverage
+                    .malformed_lines
+                    .saturating_add(snapshot.coverage.unknown_lines);
+                coverage.token_parse_failures = coverage
+                    .token_parse_failures
+                    .saturating_add(snapshot.coverage.token_parse_failures);
+                native_inputs.extend(
+                    snapshot
+                        .sessions
+                        .into_iter()
+                        .filter(|session| !session.archived)
+                        .map(|session| {
+                            let agent_id = session.agent;
+                            let agent_label = wake_core::models::AgentId::from_str(&agent_id)
+                                .map(|agent| agent.display_name().to_owned())
+                                .unwrap_or_else(|| agent_id.clone());
+                            usage_stats::UsageSessionInput {
+                                key: session.key,
+                                agent_id,
+                                agent_label,
+                                native_session_id: Some(session.native_id),
+                                project_path: session.project_path,
+                                project_label: session.project_name,
+                                model: session.model,
+                                created_at_ms: (session.created_at_ms > 0)
+                                    .then_some(session.created_at_ms),
+                                tokens: session.tokens_used,
+                                token_usage_events: session.token_usage_events,
+                                prompts: session.prompts,
+                                prompt_timestamps_ms: session.prompt_timestamps_ms,
+                            }
+                        }),
+                );
+            }
+            Err(error) => {
+                tracing::error!(%error, "native statistics index refresh failed");
+                coverage.unavailable_sources = coverage.unavailable_sources.saturating_add(1);
+                coverage.partial = true;
+            }
+        }
+    } else {
+        coverage.unavailable_sources = 1;
+        coverage.partial = true;
+    }
+
+    let device_id = doc_host.device_id().to_owned();
+    let chats = match workspace.read_chats() {
+        Ok(chats) => chats,
+        Err(error) => {
+            tracing::error!(%error, "statistics chat list unavailable");
+            coverage.unavailable_sources = coverage.unavailable_sources.saturating_add(1);
+            coverage.partial = true;
+            Vec::new()
+        }
+    };
+    let mut zeron_inputs = Vec::new();
+    for chat in chats
+        .into_iter()
+        .filter(|chat| chat.device_id == device_id && !chat.archived)
+    {
+        let prompt_timestamps = match doc_host.prompt_timestamps(&chat.id) {
+            Ok(timestamps) => timestamps,
+            Err(error) => {
+                tracing::warn!(chat = %chat.id, %error, "statistics prompt history unavailable");
+                None
+            }
+        };
+        let records = match sessions.usage_records(&chat.id) {
+            Ok(records) => Some(records),
+            Err(error) => {
+                tracing::warn!(chat = %chat.id, %error, "statistics usage journal unavailable");
+                None
+            }
+        };
+        let (session, chat_coverage) = usage_stats::from_zeron_chat(ChatUsageInput {
+            chat,
+            prompt_timestamps,
+            records,
+        });
+        coverage.unreadable_files = coverage
+            .unreadable_files
+            .saturating_add(chat_coverage.unreadable_files);
+        coverage.malformed_lines = coverage
+            .malformed_lines
+            .saturating_add(chat_coverage.malformed_lines);
+        coverage.partial |= chat_coverage.unreadable_files > 0 || chat_coverage.malformed_lines > 0;
+        zeron_inputs.push(session);
+    }
+    let sessions = usage_stats::merge_sessions(native_inputs, zeron_inputs);
+    usage_stats::build(sessions, coverage, generated_at_ms)
+}
+
 /// The transcript watch as delta frames (`zeron_doc::transcript_delta`): a
 /// full `reset` first, then only changed entries per commit — the whole-Vec
 /// serialization here was the per-tick cost that scaled with transcript size.
@@ -1907,119 +2024,21 @@ impl RpcService for EngineRpc {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::USAGE_STATISTICS => {
-                let generated_at_ms = crate::now_ms();
-                let mut coverage = UsageCoverage {
-                    last_scanned_at_ms: generated_at_ms,
-                    ..UsageCoverage::default()
-                };
-                let mut native_inputs = Vec::new();
-                if let Some(index) = self.native_usage_index.clone() {
-                    match tokio::task::spawn_blocking(move || index.refresh_and_load()).await {
-                        Ok(Ok(snapshot)) => {
-                            coverage.partial |= snapshot.coverage.partial;
-                            coverage.unreadable_files = coverage
-                                .unreadable_files
-                                .saturating_add(snapshot.coverage.failed_files);
-                            coverage.unavailable_sources = coverage
-                                .unavailable_sources
-                                .saturating_add(snapshot.coverage.failed_adapters);
-                            coverage.malformed_lines = coverage
-                                .malformed_lines
-                                .saturating_add(snapshot.coverage.unknown_lines);
-                            native_inputs.extend(
-                                snapshot
-                                    .sessions
-                                    .into_iter()
-                                    .filter(|session| !session.archived)
-                                    .map(|session| {
-                                        let agent_id = session.agent;
-                                        let agent_label =
-                                            wake_core::models::AgentId::from_str(&agent_id)
-                                                .map(|agent| agent.display_name().to_owned())
-                                                .unwrap_or_else(|| agent_id.clone());
-                                        usage_stats::UsageSessionInput {
-                                            key: session.key,
-                                            agent_id,
-                                            agent_label,
-                                            native_session_id: Some(session.native_id),
-                                            project_path: session.project_path,
-                                            project_label: session.project_name,
-                                            model: session.model,
-                                            created_at_ms: (session.created_at_ms > 0)
-                                                .then_some(session.created_at_ms),
-                                            tokens: session.tokens_used,
-                                            token_usage_events: session.token_usage_events,
-                                            prompts: session.prompts,
-                                            prompt_timestamps_ms: session.prompt_timestamps_ms,
-                                        }
-                                    }),
-                            );
-                        }
-                        Ok(Err(error)) => {
-                            tracing::error!(%error, "native statistics index refresh failed");
-                            coverage.unavailable_sources =
-                                coverage.unavailable_sources.saturating_add(1);
-                            coverage.partial = true;
-                        }
-                        Err(error) => {
-                            tracing::error!(%error, "native statistics scan task failed");
-                            coverage.unavailable_sources =
-                                coverage.unavailable_sources.saturating_add(1);
-                            coverage.partial = true;
-                        }
-                    }
-                } else {
-                    coverage.unavailable_sources = 1;
-                    coverage.partial = true;
-                }
-
-                let device_id = self.doc_host.device_id().to_owned();
-                let chats = match self.workspace.read_chats() {
-                    Ok(chats) => chats,
-                    Err(error) => {
-                        tracing::error!(%error, "statistics chat list unavailable");
-                        coverage.unavailable_sources =
-                            coverage.unavailable_sources.saturating_add(1);
-                        coverage.partial = true;
-                        Vec::new()
-                    }
-                };
-                let mut zeron_inputs = Vec::new();
-                for chat in chats
-                    .into_iter()
-                    .filter(|chat| chat.device_id == device_id && !chat.archived)
-                {
-                    let prompt_timestamps = match self.doc_host.prompt_timestamps(&chat.id) {
-                        Ok(timestamps) => timestamps,
-                        Err(error) => {
-                            tracing::warn!(chat = %chat.id, %error, "statistics prompt history unavailable");
-                            None
-                        }
-                    };
-                    let records = match self.sessions.usage_records(&chat.id) {
-                        Ok(records) => Some(records),
-                        Err(error) => {
-                            tracing::warn!(chat = %chat.id, %error, "statistics usage journal unavailable");
-                            None
-                        }
-                    };
-                    let (session, chat_coverage) = usage_stats::from_zeron_chat(ChatUsageInput {
-                        chat,
-                        prompt_timestamps,
-                        records,
-                    });
-                    coverage.unreadable_files = coverage
-                        .unreadable_files
-                        .saturating_add(chat_coverage.unreadable_files);
-                    coverage.malformed_lines = coverage
-                        .malformed_lines
-                        .saturating_add(chat_coverage.malformed_lines);
-                    coverage.partial |=
-                        chat_coverage.unreadable_files > 0 || chat_coverage.malformed_lines > 0;
-                    zeron_inputs.push(session);
-                }
-                let sessions = usage_stats::merge_sessions(native_inputs, zeron_inputs);
-                RpcReply::value(&usage_stats::build(sessions, coverage, generated_at_ms))
+                let native_usage_index = self.native_usage_index.clone();
+                let doc_host = self.doc_host.clone();
+                let sessions = self.sessions.clone();
+                let workspace = self.workspace.clone();
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    usage_statistics_snapshot(
+                        native_usage_index.as_deref(),
+                        &doc_host,
+                        &sessions,
+                        &workspace,
+                    )
+                })
+                .await
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&snapshot)
             }
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
             methods::INSTALL_HARNESS => {

@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS native_sessions (
     tokens_used            INTEGER,
     message_count          INTEGER NOT NULL DEFAULT 0,
     unknown_line_count     INTEGER NOT NULL DEFAULT 0,
-    token_usage_events     TEXT NOT NULL DEFAULT '[]'
+    token_usage_events     TEXT NOT NULL DEFAULT '[]',
+    token_usage_failed     INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_native_sessions_source_path
     ON native_sessions(source_path);
@@ -75,6 +76,9 @@ pub struct NativeSessionSummary {
     pub prompt_timestamps_ms: Vec<i64>,
     pub tokens_used: Option<u64>,
     pub token_usage_events: Vec<crate::native_token_usage::TokenUsageEvent>,
+    /// Dated token events could not be read, so `tokens_used` fell back to
+    /// the adapter's lifetime total and date-specific totals are partial.
+    pub token_usage_failed: bool,
     pub message_count: u64,
     pub unknown_line_count: u32,
 }
@@ -104,6 +108,8 @@ pub struct NativeUsageCoverage {
     pub failed_files: u64,
     pub failed_adapters: u64,
     pub unknown_lines: u64,
+    /// Indexed sessions whose dated token events could not be read.
+    pub token_parse_failures: u64,
     pub partial: bool,
 }
 
@@ -149,59 +155,19 @@ impl NativeUsageIndex {
         // The index is local application state and may have been created by an
         // earlier development build. Migrate it without masking unrelated SQL
         // failures, while keeping the new-install path idempotent.
-        let archived_column_exists = {
-            let mut statement = connection
-                .prepare("PRAGMA table_info(native_sessions)")
-                .context("inspect native usage index schema")?;
-            let names = statement.query_map([], |row| row.get::<_, String>(1))?;
-            names
-                .collect::<std::result::Result<Vec<_>, _>>()?
-                .iter()
-                .any(|name| name == "archived")
-        };
-        if !archived_column_exists {
-            connection
-                .execute(
-                    "ALTER TABLE native_sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
-                    [],
-                )
-                .context("migrate native usage index archived column")?;
-        }
-        let project_name_column_exists = {
-            let mut statement = connection
-                .prepare("PRAGMA table_info(native_sessions)")
-                .context("inspect native usage index project name")?;
-            let names = statement.query_map([], |row| row.get::<_, String>(1))?;
-            names
-                .collect::<std::result::Result<Vec<_>, _>>()?
-                .iter()
-                .any(|name| name == "project_name")
-        };
-        if !project_name_column_exists {
-            connection
-                .execute(
-                    "ALTER TABLE native_sessions ADD COLUMN project_name TEXT",
-                    [],
-                )
-                .context("migrate native usage index project name column")?;
-        }
-        let token_usage_events_column_exists = {
-            let mut statement = connection
-                .prepare("PRAGMA table_info(native_sessions)")
-                .context("inspect native token usage index schema")?;
-            let names = statement.query_map([], |row| row.get::<_, String>(1))?;
-            names
-                .collect::<std::result::Result<Vec<_>, _>>()?
-                .iter()
-                .any(|name| name == "token_usage_events")
-        };
-        if !token_usage_events_column_exists {
-            connection
-                .execute(
-                    "ALTER TABLE native_sessions ADD COLUMN token_usage_events TEXT NOT NULL DEFAULT '[]'",
-                    [],
-                )
-                .context("migrate native token usage index events")?;
+        for (column, definition) in [
+            ("archived", "archived INTEGER NOT NULL DEFAULT 0"),
+            ("project_name", "project_name TEXT"),
+            (
+                "token_usage_events",
+                "token_usage_events TEXT NOT NULL DEFAULT '[]'",
+            ),
+            (
+                "token_usage_failed",
+                "token_usage_failed INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            ensure_column(&connection, column, definition)?;
         }
         Ok(index)
     }
@@ -322,10 +288,7 @@ impl NativeUsageIndex {
 
                 // Count the summary that actually enters the index, including
                 // a cached fallback after a changed native file fails to parse.
-                coverage.unknown_lines = coverage
-                    .unknown_lines
-                    .saturating_add(summary.unknown_line_count as u64);
-                coverage.partial |= summary.unknown_line_count > 0;
+                count_summary_coverage(&mut coverage, &summary);
 
                 if let Some(project_path) = project_path_updates
                     .get(&file_ref.file_path)
@@ -395,15 +358,19 @@ fn parse_summary(
     let parsed = adapter
         .parse_session(file_ref)
         .with_context(|| format!("parse native session {}", file_ref.file_path))?;
-    let token_usage_events = crate::native_token_usage::extract(file_ref).unwrap_or_else(|error| {
-        tracing::warn!(
-            agent = %file_ref.agent.as_str(),
-            path = %file_ref.file_path,
-            %error,
-            "native token usage events could not be parsed"
-        );
-        Vec::new()
-    });
+    let (token_usage_events, token_usage_failed) =
+        match crate::native_token_usage::extract(file_ref) {
+            Ok(events) => (events, false),
+            Err(error) => {
+                tracing::warn!(
+                    agent = %file_ref.agent.as_str(),
+                    path = %file_ref.file_path,
+                    %error,
+                    "native token usage events could not be parsed"
+                );
+                (Vec::new(), true)
+            }
+        };
     let meta = parsed.meta;
     let native_id = if meta.id.trim().is_empty() {
         file_ref.native_id.clone()
@@ -473,6 +440,7 @@ fn parse_summary(
             )
         },
         token_usage_events,
+        token_usage_failed,
         message_count: meta.message_count.max(0) as u64,
         unknown_line_count: parsed.unknown_line_count,
     })
@@ -515,12 +483,42 @@ fn retain_cached_summaries(
     cached: Vec<NativeSessionSummary>,
 ) {
     for summary in cached {
-        coverage.unknown_lines = coverage
-            .unknown_lines
-            .saturating_add(summary.unknown_line_count as u64);
-        coverage.partial |= summary.unknown_line_count > 0;
+        count_summary_coverage(coverage, &summary);
         insert_candidate(candidates, summary);
     }
+}
+
+/// Count a summary's own partial-coverage signals once it enters the index.
+fn count_summary_coverage(coverage: &mut NativeUsageCoverage, summary: &NativeSessionSummary) {
+    coverage.unknown_lines = coverage
+        .unknown_lines
+        .saturating_add(summary.unknown_line_count as u64);
+    if summary.token_usage_failed {
+        coverage.token_parse_failures = coverage.token_parse_failures.saturating_add(1);
+    }
+    coverage.partial |= summary.unknown_line_count > 0 || summary.token_usage_failed;
+}
+
+fn ensure_column(connection: &Connection, column: &str, definition: &str) -> Result<()> {
+    let exists = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(native_sessions)")
+            .context("inspect native usage index schema")?;
+        let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+        names
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .iter()
+            .any(|name| name == column)
+    };
+    if !exists {
+        connection
+            .execute(
+                &format!("ALTER TABLE native_sessions ADD COLUMN {definition}"),
+                [],
+            )
+            .with_context(|| format!("migrate native usage index {column} column"))?;
+    }
+    Ok(())
 }
 
 fn check_adapter_roots(roots: &[PathBuf]) -> Result<()> {
@@ -555,9 +553,9 @@ fn check_adapter_roots(roots: &[PathBuf]) -> Result<()> {
 fn source_fingerprint(file_ref: &SessionFileRef) -> String {
     let mut hasher = Sha256::new();
     // Bump this when the compact summary's interpretation changes. It forces
-    // a one-time reparse after schema/metric changes such as archived state or
-    // Wake's canonical session identity.
-    hasher.update(b"zeron-native-usage-v4");
+    // a one-time reparse after schema/metric changes such as archived state,
+    // Wake's canonical session identity, or Claude response de-duplication.
+    hasher.update(b"zeron-native-usage-v5");
     hasher.update([0]);
     hasher.update(file_ref.agent.as_str().as_bytes());
     hasher.update([0]);
@@ -594,7 +592,7 @@ fn load_existing(connection: &Connection) -> Result<HashMap<String, ExistingSumm
                 source_mtime_ms, source_size_bytes, project_path, project_name, model,
                 archived, created_at_ms, updated_at_ms, prompts,
                 prompt_timestamps_ms, tokens_used, message_count, unknown_line_count,
-                token_usage_events
+                token_usage_events, token_usage_failed
          FROM native_sessions",
     )?;
     let rows = statement.query_map([], |row| {
@@ -641,6 +639,7 @@ fn load_existing(connection: &Connection) -> Result<HashMap<String, ExistingSumm
                 prompt_timestamps_ms,
                 tokens_used,
                 token_usage_events,
+                token_usage_failed: row.get::<_, i64>(20)? != 0,
                 message_count,
                 unknown_line_count,
             },
@@ -668,8 +667,8 @@ fn write_sessions<'a>(
                  source_mtime_ms, source_size_bytes, project_path, project_name, model,
                  archived, created_at_ms, updated_at_ms, prompts,
                  prompt_timestamps_ms, tokens_used, message_count, unknown_line_count,
-                 token_usage_events
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 token_usage_events, token_usage_failed
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )?;
         for summary in sessions {
             statement.execute(params![
@@ -695,6 +694,7 @@ fn write_sessions<'a>(
                 i64::try_from(summary.message_count).unwrap_or(i64::MAX),
                 i64::from(summary.unknown_line_count),
                 serde_json::to_string(&summary.token_usage_events)?,
+                summary.token_usage_failed,
             ])?;
         }
     }

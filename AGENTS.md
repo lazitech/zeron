@@ -42,14 +42,22 @@
   journals. Native histories are read-only; the SQLite index stores compact
   metadata and summaries, not transcript bodies. Statistics are not synced
   between devices.
-- Heatmap color intensity represents daily interaction rounds. Hovering a day
-  shows its interaction count and date-attributed Token usage in K/M/B units.
+- Heatmap color intensity represents daily date-attributed Token usage, in
+  quartile levels over the days that have dated usage (the busiest day is
+  always darkest). A day without dated token data stays at the empty shade
+  even if it had interactions. Hovering a day shows its Token usage in K/M/B
+  units and its interaction count.
 - Daily and weekly token totals need timestamped token-usage events. Some
   agents do not expose those events, so `—` means the source could not provide
   a date-specific total; it does not mean zero usage.
-- Known limitation: if parsing a native file's dated token events fails, the
-  error is logged, but current coverage metadata may not mark date-specific
-  token statistics as incomplete. Treat those totals as potentially partial.
+- Token totals mean model-processed tokens: input (including cache reads and
+  writes) plus output. Claude Code repeats one response's `usage` on each
+  split assistant row, so its parser counts each `(message.id, requestId)`
+  once. In Zeron journals, Pi `Usage` events are per API call and are summed;
+  other harnesses report per-turn snapshots, where the latest report wins.
+- If a native file's dated token events cannot be parsed, its lifetime total
+  still counts, and the session is recorded in
+  `coverage.tokenParseFailures` (coverage becomes partial).
 - Official `main` through `9e1a1115` (v0.2.102 plus subsequent updates) was
   merged on 2026-10-03 while preserving personal changes. The pre-merge state
   is saved as `backup/personal-before-upstream-20261003-f6bd1ac5`.

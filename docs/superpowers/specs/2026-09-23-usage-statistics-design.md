@@ -36,8 +36,8 @@ The page presents:
 2. Sessions, prompts, and active days for the latest seven local dates compared
    with the preceding seven dates.
 3. A Monday-aligned heatmap covering 26 calendar weeks. Color intensity
-   remains based on prompt counts; hovering a day shows its interaction count
-   and date-attributed token usage in compact K/M/B units, when available.
+   follows each day's date-attributed token usage in quartile levels; hovering
+   a day shows that usage in compact K/M/B units and its interaction count.
 4. A 26-week prompt trend stacked by agent.
 5. Prompt distributions by local hour, weekday, and month, with peak labels.
 6. Agent, project, and model rankings. Each board can be sorted by sessions,
@@ -61,8 +61,9 @@ equivalent local event source.
   Heatmap tooltips use timestamped token events. If a session has no dated
   events, its lifetime total is attributed to today only when that session was
   created today; lifetime totals are not assigned to historical dates.
-- Active days, streaks, the heatmap, agent trend, and time distributions use
-  timestamped main-line prompts only. An untimestamped prompt contributes to
+- Active days, streaks, agent trend, and time distributions use timestamped
+  main-line prompts only. Heatmap color uses date-attributed token usage,
+  ranked into quartiles over the days that have it. An untimestamped prompt contributes to
   totals and rankings but not date-based views.
 - Project rankings are keyed by the non-empty project path. Model rankings use
   the session model when available. Agents are grouped by agent family, not by
@@ -92,8 +93,8 @@ equivalent local event source.
 - Archived sessions are excluded, sidechain messages do not count as prompts,
   and matching Zeron/native sessions count once.
 - Totals, rankings, date views, and time distributions follow the metric
-  semantics above. Heatmap colors remain prompt-based, and token tooltips show
-  only date-attributed token usage.
+  semantics above. Heatmap colors and token tooltips use only
+  date-attributed token usage.
 - A partial native or Zeron history is recorded in RPC coverage metadata while
   valid records continue contributing to the snapshot; the dashboard does not
   display a coverage panel.

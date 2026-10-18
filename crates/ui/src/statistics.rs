@@ -163,18 +163,13 @@ impl StatisticsPage {
             ("交互轮数", format_count(totals.prompts), false),
             ("活跃天数", format_count(totals.active_days), false),
         ];
-        div()
-            .w_full()
-            .flex()
-            .flex_row()
-            .pb(px(16.0))
-            .border_b_1()
-            .border_color(theme.border)
-            .children(
-                metrics
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, (label, value, tokens))| {
+        let row =
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .children(metrics.into_iter().enumerate().map(
+                    |(index, (label, value, tokens))| {
                         div()
                             .flex_1()
                             .min_w_0()
@@ -202,8 +197,23 @@ impl StatisticsPage {
                                     .text_color(theme.text_muted)
                                     .child(SharedString::from(label)),
                             )
-                    }),
-            )
+                    },
+                ));
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .pb(px(16.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(row)
+            // Native sources report cache reads and writes inside their
+            // totals; say so, because they usually dominate the count.
+            .child(quiet_text(
+                theme,
+                "Token 为模型处理量：输入（含缓存读取与写入）+ 输出。",
+            ))
             .into_any_element()
     }
 
@@ -307,12 +317,7 @@ impl StatisticsPage {
     }
 
     fn activity_heatmap(&self, stats: &UsageStatistics, theme: &Theme) -> AnyElement {
-        let max_activity = stats
-            .heatmap
-            .iter()
-            .map(|day| day.prompts)
-            .max()
-            .unwrap_or(0);
+        let token_levels = TokenLevels::from_days(&stats.heatmap);
         let leading = stats
             .heatmap
             .first()
@@ -342,7 +347,7 @@ impl StatisticsPage {
                 .gap(px(HEATMAP_CELL_GAP))
                 .flex_none()
                 .children(days.iter().map(|day| match day {
-                    Some(day) => heat_cell(day, max_activity, theme).into_any_element(),
+                    Some(day) => heat_cell(day, &token_levels, theme).into_any_element(),
                     None => div().size(px(HEATMAP_CELL_SIZE)).into_any_element(),
                 }))
         });
@@ -359,7 +364,11 @@ impl StatisticsPage {
         }
         statistics_section(theme)
             .gap(px(14.0))
-            .child(section_heading(theme, "活动热力图", ""))
+            .child(section_heading(
+                theme,
+                "活动热力图",
+                "颜色深浅表示当天 Token 消耗",
+            ))
             .child(
                 div()
                     .flex()
@@ -1084,12 +1093,62 @@ fn trend_agents(trend: &[UsageTrendWeek]) -> Vec<(String, String)> {
     result
 }
 
+/// Heatmap shades, from no dated usage to the busiest quartile. The legend
+/// draws the same five steps.
+const HEAT_LEVEL_OPACITY: [f32; 5] = [0.07, 0.25, 0.45, 0.66, 0.88];
+
+/// Quartile thresholds over the days with dated token usage.
+///
+/// Daily token counts span several orders of magnitude, so a linear scale
+/// against the busiest day would leave almost every cell faint. Ranking days
+/// into quartiles, as contribution graphs do, keeps ordinary days readable.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TokenLevels {
+    thresholds: [u64; 3],
+    max: u64,
+}
+
+impl TokenLevels {
+    fn from_days(days: &[UsageDay]) -> Self {
+        let mut used = days
+            .iter()
+            .filter_map(|day| day.tokens.filter(|tokens| *tokens > 0))
+            .collect::<Vec<_>>();
+        if used.is_empty() {
+            return Self::default();
+        }
+        used.sort_unstable();
+        let quantile = |numerator: usize| used[(used.len() - 1) * numerator / 4];
+        Self {
+            thresholds: [quantile(1), quantile(2), quantile(3)],
+            max: used[used.len() - 1],
+        }
+    }
+
+    /// 0 for a day without dated usage, then 1 through 4 by quartile. The
+    /// busiest day always takes the darkest shade, including when only one
+    /// day has usage or every day reports the same total.
+    fn level(&self, tokens: Option<u64>) -> usize {
+        match tokens {
+            None | Some(0) => 0,
+            Some(tokens) if tokens >= self.max => 4,
+            Some(tokens) => {
+                1 + self
+                    .thresholds
+                    .iter()
+                    .filter(|threshold| tokens > **threshold)
+                    .count()
+            }
+        }
+    }
+}
+
 fn heatmap_legend(theme: &Theme) -> gpui::Div {
-    let cells = (0..5).map(|index| {
+    let cells = HEAT_LEVEL_OPACITY.into_iter().map(|opacity| {
         div()
             .size(px(HEATMAP_LEGEND_CELL_SIZE))
             .rounded(px(2.0))
-            .bg(theme.accent.opacity(0.12 + index as f32 * 0.18))
+            .bg(theme.accent.opacity(opacity))
     });
     div()
         .flex()
@@ -1101,24 +1160,18 @@ fn heatmap_legend(theme: &Theme) -> gpui::Div {
         .child(quiet_text(theme, "多"))
 }
 
-fn heat_cell(day: &UsageDay, max_prompts: u64, theme: &Theme) -> gpui::Stateful<gpui::Div> {
-    let opacity = if day.prompts == 0 {
-        0.07
-    } else if max_prompts == 0 {
-        0.25
-    } else {
-        (0.2 + 0.68 * day.prompts as f32 / max_prompts as f32).clamp(0.2, 0.88)
-    };
+fn heat_cell(day: &UsageDay, levels: &TokenLevels, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+    let opacity = HEAT_LEVEL_OPACITY[levels.level(day.tokens)];
     let token_label = day
         .tokens
         .map(format_heatmap_tokens)
         .map(|tokens| format!("Token 消耗 {tokens}"))
         .unwrap_or_else(|| "Token 消耗暂无日期明细".into());
     let date_label = format!(
-        "{} · {} 轮交互 · {}",
+        "{} · {} · {} 轮交互",
         format_day_label(&day.day),
-        format_count(day.prompts),
-        token_label
+        token_label,
+        format_count(day.prompts)
     );
     div()
         .id(SharedString::from(format!("stats-day-{}", day.day)))
@@ -1352,5 +1405,43 @@ fn format_heatmap_tokens(value: u64) -> String {
         format!("{rounded:.0}{suffix}")
     } else {
         format!("{rounded:.1}{suffix}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn day(tokens: Option<u64>) -> UsageDay {
+        UsageDay {
+            tokens,
+            ..UsageDay::default()
+        }
+    }
+
+    #[test]
+    fn token_levels_rank_days_by_quartile() {
+        let days = [
+            day(None),
+            day(Some(0)),
+            day(Some(1_000)),
+            day(Some(20_000)),
+            day(Some(300_000)),
+            day(Some(4_000_000)),
+            day(Some(500_000_000)),
+        ];
+        let levels = TokenLevels::from_days(&days);
+        assert_eq!(levels.thresholds, [20_000, 300_000, 4_000_000]);
+        let shades: Vec<_> = days.iter().map(|day| levels.level(day.tokens)).collect();
+        assert_eq!(shades, vec![0, 0, 1, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn the_busiest_day_takes_the_darkest_shade() {
+        let levels = TokenLevels::from_days(&[day(None), day(Some(42))]);
+        assert_eq!(levels.level(Some(42)), 4);
+        assert_eq!(levels.level(None), 0);
+        let equal = TokenLevels::from_days(&[day(Some(9)), day(Some(9))]);
+        assert_eq!(equal.level(Some(9)), 4);
     }
 }

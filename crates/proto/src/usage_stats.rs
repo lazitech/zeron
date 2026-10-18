@@ -15,8 +15,8 @@ pub struct UsageStatistics {
     /// Seven local calendar dates immediately before `recent_days`.
     pub previous_days: Vec<UsageDay>,
     /// 26 Monday-aligned calendar weeks (182 dates), including empty future
-    /// dates in the current week. Heatmap color is prompt-only, matching
-    /// Wake's Insights semantics; dated token usage is included for tooltips.
+    /// dates in the current week. The UI shades each date by its dated token
+    /// usage; prompt counts are included for tooltips.
     pub heatmap: Vec<UsageDay>,
     /// Per-agent prompt counts for the same 26 calendar weeks as the heatmap.
     pub agent_trend: Vec<UsageTrendWeek>,
@@ -124,6 +124,9 @@ pub struct UsageCoverage {
     pub unavailable_sources: u64,
     /// Unsupported or malformed lines retained as partial session coverage.
     pub malformed_lines: u64,
+    /// Sessions whose dated token events could not be read. Their lifetime
+    /// totals still count, but daily and weekly totals may be partial.
+    pub token_parse_failures: u64,
     /// Some supported agents do not record token counts in their local history.
     pub agents_without_token_data: u64,
     /// Most recent successful or partial local index refresh.
