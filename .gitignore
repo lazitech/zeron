@@ -12,7 +12,11 @@ build/
 edge/dist/
 # Ignore newly added files under docs; existing tracked documentation remains tracked.
 /docs/
+# the card pages' static files, copied in by `npm -C edge run card-assets`
+edge/public/
 .agents
 .claude
 CLAUDE.md
 /scripts/**/__pycache__/
+.dev.vars
+.dev.vars.*

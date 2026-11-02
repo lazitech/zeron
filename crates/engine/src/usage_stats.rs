@@ -83,9 +83,11 @@ impl AgentIdentity {
             HarnessId::Devin => "Devin",
             HarnessId::Grok => "Grok",
             HarnessId::Hermes => "Hermes",
+            HarnessId::Fx => "fx",
             HarnessId::Pi => "Pi",
             HarnessId::Opencode => "OpenCode",
             HarnessId::Antigravity => "Antigravity",
+            HarnessId::Muse => "Muse Code",
             HarnessId::Mock => "Mock",
         };
         Self {
@@ -135,9 +137,21 @@ struct RankAccumulator {
     label: String,
 }
 
-/// Turn one Zeron chat and its journal into the same compact form used for
-/// native sessions. The caller supplies device/profile filtering.
-pub(crate) fn from_zeron_chat(input: ChatUsageInput) -> (UsageSessionInput, UsageInputCoverage) {
+struct JournalSpan {
+    start: usize,
+    end: usize,
+    harness: Option<HarnessId>,
+    identity: AgentIdentity,
+    native_session_id: Option<String>,
+    started_at_ms: Option<i64>,
+}
+
+/// Turn a Zeron chat into one summary per native session. A chat may now
+/// switch providers and later resume an earlier provider's native session.
+/// The caller supplies device/profile filtering.
+pub(crate) fn from_zeron_chat(
+    input: ChatUsageInput,
+) -> (Vec<UsageSessionInput>, UsageInputCoverage) {
     let (records, skipped_lines, journal_unreadable) = match input.records {
         Some((records, skipped_lines)) => (records, skipped_lines, false),
         None => (Vec::new(), 0, true),
@@ -150,84 +164,199 @@ pub(crate) fn from_zeron_chat(input: ChatUsageInput) -> (UsageSessionInput, Usag
         None => (Vec::new(), true),
     };
 
-    let mut identity =
-        input.chat.config.as_ref().map(|config| {
-            AgentIdentity::new(config.harness, config.model.as_deref().unwrap_or(""))
+    let configured_harness = input.chat.config.as_ref().map(|config| config.harness);
+    let mut spans = journal_spans(&records, configured_harness, input.chat.config.as_ref());
+    // Older journals may name the native session only at Done, while a chat
+    // row can provide the latest id when the journal has no usable id at all.
+    for span in &mut spans {
+        if span.native_session_id.is_none() {
+            span.native_session_id =
+                records[span.start..span.end]
+                    .iter()
+                    .rev()
+                    .find_map(|record| match &record.event {
+                        AgentEvent::Done {
+                            session_id: Some(id),
+                            ..
+                        } => nonempty(id),
+                        _ => None,
+                    });
+        }
+    }
+    if let Some(last) = spans.last_mut()
+        && last.native_session_id.is_none()
+        && input
+            .chat
+            .harness_session_harness
+            .as_deref()
+            .is_none_or(|owner| {
+                last.harness
+                    .is_some_and(|harness| harness.as_str() == owner)
+            })
+    {
+        last.native_session_id = input.chat.harness_session_id.as_deref().and_then(nonempty);
+    }
+
+    // The prompt that triggers a provider switch is written before the next
+    // SessionStarted event. The preceding Done is the best journal boundary;
+    // prompts queued during a previous turn cannot be attributed exactly from
+    // timestamps alone, but remain counted once.
+    let boundaries: Vec<Option<i64>> = spans
+        .iter()
+        .take(spans.len().saturating_sub(1))
+        .map(|span| {
+            records[span.start..span.end]
+                .iter()
+                .rev()
+                .find(|record| matches!(record.event, AgentEvent::Done { .. }))
+                .and_then(|record| record.timestamp_ms)
+                .or_else(|| {
+                    records[span.start..span.end]
+                        .iter()
+                        .rev()
+                        .find_map(|record| record.timestamp_ms)
+                })
+        })
+        .collect();
+    let mut prompts_by_span = vec![Vec::new(); spans.len()];
+    for timestamp in prompt_timestamps_ms {
+        let mut index = 0;
+        for (boundary_index, boundary) in boundaries.iter().enumerate() {
+            if boundary.is_some_and(|boundary| timestamp > boundary) {
+                index = boundary_index + 1;
+            } else {
+                break;
+            }
+        }
+        prompts_by_span[index].push(timestamp);
+    }
+
+    let mut sessions: Vec<UsageSessionInput> = Vec::new();
+    for (index, (span, prompts)) in spans.into_iter().zip(prompts_by_span).enumerate() {
+        let existing = span.native_session_id.as_deref().and_then(|native_id| {
+            sessions.iter().position(|session| {
+                session.agent_id == span.identity.id
+                    && session.native_session_id.as_deref() == Some(native_id)
+            })
         });
-    let mut native_session_id = input.chat.harness_session_id.as_deref().and_then(nonempty);
-    // Root SessionStarted rows carry the native resume id and the effective
-    // model. Subagent SessionStarted rows are nested and do not identify the
-    // chat's primary session.
-    for record in &records {
-        if let AgentEvent::SessionStarted {
+        let target = match existing {
+            Some(index) => index,
+            None => {
+                sessions.push(UsageSessionInput {
+                    key: format!("zeron:{}:{index}", input.chat.id),
+                    agent_id: span.identity.id,
+                    agent_label: span.identity.label,
+                    native_session_id: span.native_session_id,
+                    project_path: input.chat.cwd.as_deref().and_then(nonempty),
+                    project_label: input.chat.cwd.as_deref().and_then(project_label),
+                    model: span.identity.model.or_else(|| {
+                        input.chat.config.as_ref().and_then(|config| {
+                            (Some(config.harness) == span.harness)
+                                .then(|| config.model.as_deref().and_then(nonempty))
+                                .flatten()
+                        })
+                    }),
+                    created_at_ms: if index == 0 {
+                        Some(input.chat.created_at.timestamp_millis())
+                    } else {
+                        prompts.first().copied().or(span.started_at_ms)
+                    },
+                    ..UsageSessionInput::default()
+                });
+                sessions.len() - 1
+            }
+        };
+        let session = &mut sessions[target];
+        session.prompts = session.prompts.saturating_add(prompts.len() as u64);
+        session.prompt_timestamps_ms.extend(prompts);
+        for turn in turns_from_records(&records[span.start..span.end], span.harness) {
+            for report in turn
+                .usage_by_lane
+                .values()
+                .flat_map(|lane| lane.reports.iter())
+            {
+                session.tokens = Some(session.tokens.unwrap_or(0).saturating_add(report.tokens));
+                if let Some(timestamp_ms) = report.timestamp_ms {
+                    session.token_usage_events.push(TokenUsageEvent {
+                        timestamp_ms,
+                        tokens: report.tokens,
+                    });
+                }
+            }
+        }
+    }
+    let coverage = UsageInputCoverage {
+        unreadable_files: u64::from(chat_unreadable) + u64::from(journal_unreadable),
+        malformed_lines: skipped_lines,
+    };
+    (sessions, coverage)
+}
+
+/// Root SessionStarted events name the native session for subsequent rows.
+/// Repeated starts of the same session remain in one span, preserving the
+/// per-turn and subagent folding rules used before provider switching.
+fn journal_spans(
+    records: &[JournalRecord],
+    configured_harness: Option<HarnessId>,
+    config: Option<&zeron_proto::ChatConfig>,
+) -> Vec<JournalSpan> {
+    let mut spans: Vec<JournalSpan> = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        let AgentEvent::SessionStarted {
             harness,
             model,
             session_id,
             ..
         } = &record.event
-        {
-            identity = Some(AgentIdentity::new(*harness, model));
-            native_session_id = nonempty(session_id);
+        else {
+            continue;
+        };
+        let native_id = nonempty(session_id);
+        let changed = spans.last().is_some_and(|span| {
+            span.harness != Some(*harness)
+                || matches!((&span.native_session_id, &native_id), (Some(old), Some(new)) if old != new)
+        });
+        if changed {
+            spans.last_mut().unwrap().end = index;
         }
-    }
-    let identity = identity.unwrap_or_else(AgentIdentity::unknown);
-    let configured_harness = input.chat.config.as_ref().map(|config| config.harness);
-    let turns = turns_from_records(&records, configured_harness);
-    let mut token_total = 0u64;
-    let mut token_usage_events = Vec::new();
-    let mut has_token_data = false;
-    for turn in turns {
-        for report in turn
-            .usage_by_lane
-            .values()
-            .flat_map(|lane| lane.reports.iter())
-        {
-            has_token_data = true;
-            token_total = token_total.saturating_add(report.tokens);
-            if let Some(timestamp_ms) = report.timestamp_ms {
-                token_usage_events.push(TokenUsageEvent {
-                    timestamp_ms,
-                    tokens: report.tokens,
-                });
+        if spans.is_empty() || changed {
+            spans.push(JournalSpan {
+                start: if spans.is_empty() { 0 } else { index },
+                end: records.len(),
+                harness: Some(*harness),
+                identity: AgentIdentity::new(*harness, model),
+                native_session_id: native_id,
+                started_at_ms: record.timestamp_ms,
+            });
+        } else if let Some(span) = spans.last_mut() {
+            span.identity = AgentIdentity::new(*harness, model);
+            if span.native_session_id.is_none() {
+                span.native_session_id = native_id;
             }
         }
     }
-
-    let model = identity.model.or_else(|| {
-        input
-            .chat
-            .config
-            .as_ref()
-            .and_then(|config| config.model.as_deref().and_then(nonempty))
-    });
-    let session = UsageSessionInput {
-        // Keep the local chat row unique until merge_sessions has enough
-        // native identity and creation-time information to match it safely.
-        key: format!("zeron:{}", input.chat.id),
-        agent_id: identity.id,
-        agent_label: identity.label,
-        native_session_id,
-        project_path: input.chat.cwd.as_deref().and_then(nonempty),
-        project_label: input.chat.cwd.as_deref().and_then(project_label),
-        model,
-        created_at_ms: Some(input.chat.created_at.timestamp_millis()),
-        tokens: has_token_data.then_some(token_total),
-        token_usage_events,
-        prompts: prompt_timestamps_ms.len() as u64,
-        prompt_timestamps_ms,
-    };
-    let coverage = UsageInputCoverage {
-        unreadable_files: u64::from(chat_unreadable) + u64::from(journal_unreadable),
-        malformed_lines: skipped_lines,
-    };
-    (session, coverage)
+    if spans.is_empty() {
+        spans.push(JournalSpan {
+            start: 0,
+            end: records.len(),
+            harness: configured_harness,
+            identity: config
+                .map(|config| {
+                    AgentIdentity::new(config.harness, config.model.as_deref().unwrap_or(""))
+                })
+                .unwrap_or_else(AgentIdentity::unknown),
+            native_session_id: None,
+            started_at_ms: None,
+        });
+    }
+    spans
 }
 
 /// Merge Zeron chats into native history. The native row is authoritative when
 /// present; journal/doc values fill fields that the native adapter cannot read.
 pub(crate) fn merge_sessions(
     native: Vec<UsageSessionInput>,
-    zeron: Vec<UsageSessionInput>,
+    zeron: Vec<Vec<UsageSessionInput>>,
 ) -> Vec<UsageSessionInput> {
     let mut sessions: BTreeMap<String, UsageSessionInput> = BTreeMap::new();
     let mut native_keys = HashMap::<(String, String), Vec<String>>::new();
@@ -240,7 +369,7 @@ pub(crate) fn merge_sessions(
         }
         sessions.insert(session.key.clone(), session);
     }
-    for session in zeron {
+    for session in zeron.into_iter().flatten() {
         let matching_key = session
             .native_session_id
             .as_deref()
@@ -836,12 +965,16 @@ mod tests {
     }
 
     fn started(harness: HarnessId) -> AgentEvent {
+        started_session(harness, "native")
+    }
+
+    fn started_session(harness: HarnessId, session_id: &str) -> AgentEvent {
         AgentEvent::SessionStarted {
             harness,
             model: "model".into(),
             tools: Vec::new(),
             cwd: "/repo".into(),
-            session_id: "native".into(),
+            session_id: session_id.into(),
             assistant_message_id: "a1".into(),
         }
     }
@@ -940,7 +1073,7 @@ mod tests {
         zeron.prompts = 3;
         let unrelated = session("zeron:other", "n2", 1_200);
 
-        let merged = merge_sessions(vec![native], vec![zeron, unrelated]);
+        let merged = merge_sessions(vec![native], vec![vec![zeron], vec![unrelated]]);
         assert_eq!(merged.len(), 2);
         let native = merged
             .iter()
@@ -949,6 +1082,113 @@ mod tests {
         // Native tokens are authoritative; Zeron fills the missing prompts.
         assert_eq!(native.tokens, Some(500));
         assert_eq!(native.prompts, 3);
+    }
+
+    fn switched_chat_records() -> Vec<JournalRecord> {
+        vec![
+            record(1, 100, started_session(HarnessId::Codex, "codex-1")),
+            record(2, 110, usage(10, 1)),
+            record(3, 120, usage(20, 2)),
+            record(4, 130, done()),
+            record(5, 200, started_session(HarnessId::Pi, "pi-1")),
+            record(6, 210, usage(30, 3)),
+            record(7, 220, usage(40, 4)),
+            record(8, 230, done()),
+            record(9, 300, started_session(HarnessId::Codex, "codex-1")),
+            record(10, 310, usage(50, 5)),
+            record(11, 320, done()),
+        ]
+    }
+
+    fn chat() -> zeron_proto::Chat {
+        serde_json::from_value(serde_json::json!({
+            "id": "chat-1",
+            "deviceId": "local",
+            "archived": false,
+            "cwd": "/repo",
+            "createdAt": "1970-01-01T00:00:00.050Z"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn switched_provider_sessions_merge_with_only_their_own_native_history() {
+        let (segments, coverage) = from_zeron_chat(ChatUsageInput {
+            chat: chat(),
+            prompt_timestamps: Some(vec![90, 190, 290]),
+            records: Some((switched_chat_records(), 0)),
+        });
+        assert_eq!(coverage.unreadable_files, 0);
+        assert_eq!(segments.len(), 2, "the resumed Codex session is one row");
+        let codex = segments.iter().find(|s| s.agent_id == "codex").unwrap();
+        assert_eq!(codex.tokens, Some(77)); // latest Codex report per turn
+        assert_eq!(codex.prompt_timestamps_ms, vec![90, 290]);
+        let pi = segments.iter().find(|s| s.agent_id == "pi").unwrap();
+        assert_eq!(pi.tokens, Some(77)); // both Pi API calls
+        assert_eq!(pi.prompt_timestamps_ms, vec![190]);
+
+        // With only Codex's native history, its complete native total wins;
+        // Pi falls back to its own journal, never the whole chat's usage.
+        let mut native_codex = session("native-codex", "codex-1", 100);
+        native_codex.tokens = Some(200);
+        let merged = merge_sessions(vec![native_codex], vec![segments.clone()]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged.iter().map(|s| s.tokens.unwrap_or(0)).sum::<u64>(),
+            277
+        );
+        assert_eq!(
+            merged.iter().find(|s| s.agent_id == "pi").unwrap().tokens,
+            Some(77)
+        );
+
+        // The inverse availability must not drop or duplicate Codex's usage.
+        let mut native_pi = session("native-pi", "pi-1", 190);
+        native_pi.agent_id = "pi".into();
+        native_pi.agent_label = "Pi".into();
+        native_pi.tokens = Some(300);
+        let merged = merge_sessions(vec![native_pi], vec![segments]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged.iter().map(|s| s.tokens.unwrap_or(0)).sum::<u64>(),
+            377
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .find(|s| s.agent_id == "codex")
+                .unwrap()
+                .tokens,
+            Some(77)
+        );
+    }
+
+    #[test]
+    fn switched_sessions_of_the_same_provider_do_not_share_usage() {
+        let records = vec![
+            record(1, 100, started_session(HarnessId::Codex, "old")),
+            record(2, 110, usage(10, 1)),
+            record(3, 120, done()),
+            record(4, 200, started_session(HarnessId::Codex, "fresh")),
+            record(5, 210, usage(30, 3)),
+            record(6, 220, done()),
+        ];
+        let (segments, _) = from_zeron_chat(ChatUsageInput {
+            chat: chat(),
+            prompt_timestamps: Some(vec![90, 190]),
+            records: Some((records, 0)),
+        });
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].native_session_id.as_deref(), Some("old"));
+        assert_eq!(segments[0].tokens, Some(11));
+        assert_eq!(segments[1].native_session_id.as_deref(), Some("fresh"));
+        assert_eq!(segments[1].tokens, Some(33));
+    }
+
+    #[test]
+    fn upstream_harnesses_have_statistics_identities() {
+        assert_eq!(AgentIdentity::new(HarnessId::Fx, "").label, "fx");
+        assert_eq!(AgentIdentity::new(HarnessId::Muse, "").label, "Muse Code");
     }
 
     #[test]

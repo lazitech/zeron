@@ -70,6 +70,16 @@ pub enum AppshotPlatform {
     Unsupported,
 }
 
+impl AppshotPlatform {
+    pub(crate) fn shortcut_title(self) -> &'static str {
+        if self == Self::LinuxWayland {
+            "Preferred shortcut"
+        } else {
+            "Global shortcut"
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityState {
     Checking,

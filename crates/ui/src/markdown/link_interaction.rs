@@ -256,9 +256,10 @@ impl Element for LinkRanges {
                             cx,
                         );
                         let dismissed = state.dismissed.clone();
-                        let epoch = state.epoch.clone();
                         // This disclosure is not a menu: menu_at consumes every
                         // outside press, preventing other controls from receiving it.
+                        // An outside press only hides it; the links keep their
+                        // ids, so a press on one of them still clicks it.
                         let mut popup = gpui::deferred(
                             gpui::anchored()
                                 .position(rect.bottom_left())
@@ -270,7 +271,6 @@ impl Element for LinkRanges {
                                         .occlude()
                                         .on_mouse_down_out(move |_, window, _| {
                                             dismissed.set(true);
-                                            epoch.set(epoch.get().wrapping_add(1));
                                             window.refresh();
                                         })
                                         .child(card),
@@ -793,6 +793,7 @@ mod rendered_tests {
         ignore = "requires a native desktop; run with --ignored --test-threads=1"
     )]
     fn focused_destination_does_not_block_other_controls() {
+        let _selection = super::super::selection::test_state_lock();
         test_application().run(|cx| {
             cx.set_global(Theme::dark());
             let clicks = Rc::new(Cell::new(0));
@@ -1093,6 +1094,7 @@ mod rendered_tests {
         ignore = "requires a native desktop; run with --ignored --test-threads=1"
     )]
     fn rendered_truncation_resizes_and_selects_the_original_url() {
+        let _selection = super::super::selection::test_state_lock();
         test_application().run(|cx| {
             cx.set_global(Theme::dark());
             let url = format!("https://example.com/{}", "long-segment-🙂/".repeat(20));

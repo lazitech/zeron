@@ -73,6 +73,23 @@
   skipped-line counter for usage-stats coverage). The merge also exposed one
   genuinely dead personal dependency (`nucleo-matcher`, superseded by
   upstream's `fff-search`), now removed.
+- Official `main` through `a7947b72` (v0.2.132, 115 commits past the prior
+  merge) was merged on 2026-11-02 while preserving personal changes. The
+  pre-merge state is saved as
+  `backup/personal-before-upstream-20261102-a13b8517`. This update includes
+  provider switching and access/plan modes, background process management,
+  Linux WPE browser support with WebKitGTK fallback, smooth scrolling,
+  Markdown/math/image rendering, and synchronization fixes. Personal statistics,
+  session token/context snapshots, native history readers, Pi context/history
+  bridges, full-window backgrounds, mouse navigation, and the isolated Conda
+  build/cleanup workflow are retained. Provider switches clear outgoing usage
+  snapshots, and statistics attribute journal usage to each native provider
+  session so switched chats can be deduplicated against native histories.
+  Validation also fixed upstream's Wayland Appshots search-label mismatch
+  and isolated Markdown tests that share process-wide selection state. The
+  workspace build, 3,645 core/integration tests, Pi context Node tests, and
+  isolated desktop checks passed; default cleanup freed about 11.12 GiB and
+  retained the runnable v0.2.132 executable (349 MiB target directory).
   Later upstream updates must follow the requested workflow below, preserving
   personal changes and inspecting the resulting diff. Do not start an upstream
   update without a user request.
